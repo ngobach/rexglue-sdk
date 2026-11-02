@@ -16,6 +16,9 @@
 
 #include <rex/codegen/binary_view.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
+
+#include <ppc.h>
 
 #include "../codegen_logging.h"
 #include <rex/system/export_resolver.h>
@@ -46,6 +49,46 @@ const FunctionGraph& BuilderContext::graph() const {
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
 bool BuilderContext::localizeNonVolatiles() const {
   return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+}
+
+bool BuilderContext::emitsLabel(uint32_t target) const {
+  using rex::memory::load_and_swap;
+
+  // A goto is only safe when the emitter will actually place `loc_<target>:`.
+  // That requires the target to sit inside one of this function's mapped blocks
+  // and some non-link branch in those blocks to reference it.
+  bool target_in_mapped_block = false;
+  for (const auto& block : fn.blocks()) {
+    if (target < block.base || target >= block.end())
+      continue;
+    if (!emitCtx.binary.translate(block.base))
+      return false;
+    target_in_mapped_block = true;
+    break;
+  }
+  if (!target_in_mapped_block)
+    return false;
+
+  for (const auto& block : fn.blocks()) {
+    const uint8_t* block_data = emitCtx.binary.translate(block.base);
+    if (!block_data)
+      continue;
+    for (uint32_t addr = block.base; addr < block.end(); addr += 4) {
+      uint32_t instruction =
+          load_and_swap<uint32_t>(block_data + (addr - block.base));
+      if (PPC_BL(instruction))
+        continue;
+      uint32_t op = PPC_OP(instruction);
+      if (op == PPC_OP_B) {
+        if (addr + PPC_BI(instruction) == target)
+          return true;
+      } else if (op == PPC_OP_BC) {
+        if (addr + PPC_BD(instruction) == target)
+          return true;
+      }
+    }
+  }
+  return false;
 }
 
 std::string BuilderContext::r(size_t index) {
@@ -198,6 +241,16 @@ void BuilderContext::emit_function_call(uint32_t address) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
 
+      // A discovered function without a resolved symbol cannot be called from
+      // generated code; emitting an empty callee produces invalid C++.
+      if (name.empty()) {
+        REXCODEGEN_ERROR("Unresolved function 0x{:08X} from 0x{:08X} (empty symbol name)",
+                         address, base);
+        println("\t// FATAL: unresolved function 0x{:08X} (empty symbol name)", address);
+        println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", base, address);
+        return;
+      }
+
       // Handle save/restore helpers. Gated on the global setting, not this
       // function's: the helper bodies are emitted under it too, so once they
       // spill to locals they are no-ops that scribble zeros on the caller's
@@ -269,7 +322,18 @@ void BuilderContext::emit_function_call(uint32_t address) {
     return;
   }
 
-  // No pre-resolved target found - this is an error
+  // No pre-resolved target found. Before giving up, consult the graph: a
+  // function may have been registered after the call was scanned (for example
+  // through [functions] overrides in the manifest).
+  if (const FunctionNode* target_fn = graph().getFunction(address)) {
+    if (!target_fn->isImport() && !target_fn->name().empty()) {
+      emitCtx.reference(target_fn->name());
+      println("\t{}(ctx, base);", target_fn->name());
+      return;
+    }
+  }
+
+  // This is an error
   REXCODEGEN_ERROR("Unresolved function 0x{:08X} from 0x{:08X} (no CallTarget in FunctionNode)",
                    address, base);
   println("\t// FATAL: unresolved function 0x{:08X} (no CallTarget in FunctionNode)", address);
@@ -285,9 +349,34 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 
   switch (kind) {
     case TargetKind::InternalLabel:
-      // Target is within this function - local goto
-      println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
-              target);
+      // Target is within this function - local goto. Also verify the block is
+      // owned by the function being emitted: with overlapping functions
+      // classifyTarget can resolve the caller through a different node.
+      if (!fn.containsAddress(target) || !emitsLabel(target)) {
+        // A join point the emitter cannot label. If something is registered at
+        // that address, treat it as a tail call instead of aborting.
+        if (const FunctionNode* target_fn = graph().getFunction(target)) {
+          if (!target_fn->isImport() && !target_fn->name().empty()) {
+            REXCODEGEN_WARN(
+                "conditional branch target 0x{:08X} from 0x{:08X} has no label; tail-calling",
+                target, base);
+            emitCtx.reference(target_fn->name());
+            println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
+            println("\t\t{}(ctx, base);", target_fn->name());
+            println("\t\treturn;");
+            println("\t}}");
+            break;
+          }
+        }
+        REXCODEGEN_WARN(
+            "conditional branch target 0x{:08X} from 0x{:08X} has no label in this function",
+            target, base);
+        println("\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");",
+                not_ ? "!" : "", cr(insn.operands[0]), cond, base, target);
+      } else {
+        println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
+                target);
+      }
       break;
 
     case TargetKind::Function:
@@ -296,6 +385,12 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
       if (const auto* callTarget = findCallTarget(base)) {
         if (callTarget->isFunction()) {
           auto* targetFn = callTarget->asFunction();
+          if (targetFn->name().empty()) {
+            println(
+                "\tif ({}{}.{}) REX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");",
+                not_ ? "!" : "", cr(insn.operands[0]), cond, base, target);
+            break;
+          }
           emitCtx.reference(targetFn->name());
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
           println("\t\t{}(ctx, base);", targetFn->name());

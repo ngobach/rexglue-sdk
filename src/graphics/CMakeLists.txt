@@ -41,6 +41,19 @@ set(REXGPU_XENOS_SPIRV_SOURCES
     pipeline/shader/spirv_translator_rb.cpp
 )
 
+# OpenGL ES backend (R36S: Mali-G31 has no Vulkan).
+set(REXGPU_XENOS_GLES_SOURCES
+    gles/graphics_system.cpp
+    gles/command_processor.cpp
+    gles/shader.cpp
+    gles/shared_memory.cpp
+    gles/texture_cache.cpp
+    gles/render_target_cache.cpp
+    gles/pipeline_cache.cpp
+    gles/primitive_processor.cpp
+    gles/constants.cpp
+)
+
 # Vulkan backend
 set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
@@ -87,6 +100,10 @@ endif()
 
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
+endif()
+
+if(REXGLUE_USE_GLES)
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_GLES_SOURCES})
 endif()
 
 if(REXGLUE_USE_D3D12)
@@ -149,6 +166,10 @@ if(REXGLUE_USE_VULKAN)
         OSDependent
         OGLCompiler
     )
+endif()
+
+if(REXGLUE_USE_GLES)
+    target_link_libraries(rexgpu-xenos PRIVATE rex-spirv-cross)
 endif()
 
 if(REXGLUE_USE_D3D12)

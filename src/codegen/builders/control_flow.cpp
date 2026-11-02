@@ -33,8 +33,33 @@ bool build_b(BuilderContext& ctx) {
 
   switch (kind) {
     case TargetKind::InternalLabel:
-      // Target is within this function and not another function's entry point
-      ctx.println("\tgoto loc_{:X};", target);
+      // Target is within this function and not another function's entry point.
+      // Address ranges can overlap (analysis discovers nested/partial
+      // functions), so classifyTarget may have resolved the caller through a
+      // different FunctionNode than the one being emitted. Only emit a goto
+      // when the block actually belongs to this function; otherwise the label
+      // would be undefined in this translation unit.
+      if (!ctx.fn.containsAddress(target) || !ctx.emitsLabel(target)) {
+        // Join point the emitter cannot label: fall back to a tail call when a
+        // function is registered there, otherwise keep the fatal.
+        if (const FunctionNode* target_fn = ctx.graph().getFunction(target);
+            target_fn && !target_fn->isImport() && !target_fn->name().empty()) {
+          REXCODEGEN_WARN(
+              "b target 0x{:08X} from 0x{:08X} has no label; tail-calling", target, ctx.base);
+          ctx.emit_function_call(target);
+          ctx.println("\treturn;");
+          break;
+        }
+        REXCODEGEN_WARN(
+            "b target 0x{:08X} from 0x{:08X} has no label in this function; emitting fatal",
+            target, ctx.base);
+        ctx.println("\t// FATAL: branch target 0x{:08X} not in this function", target);
+        ctx.println("\tREX_FATAL(\"Unresolved branch from 0x{:08X} to 0x{:08X}\");", ctx.base,
+                    target);
+        ctx.println("\treturn;");
+      } else {
+        ctx.println("\tgoto loc_{:X};", target);
+      }
       break;
 
     case TargetKind::Function:
@@ -45,8 +70,10 @@ bool build_b(BuilderContext& ctx) {
       break;
 
     case TargetKind::Unknown:
-      // Unknown target - fall back to range check
-      if (target >= ctx.fn.base() && target < ctx.fn.end()) {
+      // Unknown target - fall back to range check, but only when the target is
+      // inside this function's blocks and an emitted label of this function
+      // (otherwise the label is undefined).
+      if (ctx.fn.containsAddress(target) && ctx.emitsLabel(target)) {
         ctx.println("\tgoto loc_{:X};", target);
       } else {
         REXCODEGEN_WARN("Unresolved b target 0x{:08X} from 0x{:08X}", target, ctx.base);
@@ -73,7 +100,15 @@ bool build_bl(BuilderContext& ctx) {
     case TargetKind::InternalLabel:
       // PIC code pattern - bl to get PC into LR, treat as local jump
       // LR is already set above, now jump to the target
-      ctx.println("\tgoto loc_{:X};", target);
+      if (!ctx.fn.containsAddress(target) || !ctx.emitsLabel(target)) {
+        REXCODEGEN_WARN(
+            "PIC bl target 0x{:08X} from 0x{:08X} has no label in this function", target,
+            ctx.base);
+        ctx.println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", ctx.base,
+                    target);
+      } else {
+        ctx.println("\tgoto loc_{:X};", target);
+      }
       break;
 
     case TargetKind::Function:

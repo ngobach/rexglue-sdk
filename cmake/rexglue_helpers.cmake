@@ -12,7 +12,10 @@ function(_rexglue_stage_macos_vulkan_runtime target_name)
     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
         set(_rexglue_vulkan_loader Vulkan::Loader)
         set(_rexglue_moltenvk MoltenVK::MoltenVK)
-        set(_rexglue_moltenvk_icd "${REXGLUE_ROOT}/cmake/MoltenVK_icd.json")
+        # CMAKE_CURRENT_FUNCTION_LIST_DIR is the directory of this file, which
+        # also works when the SDK is consumed via add_subdirectory() and
+        # REXGLUE_ROOT is not set.
+        set(_rexglue_moltenvk_icd "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MoltenVK_icd.json")
     elseif(TARGET rex::vulkan-loader AND TARGET rex::moltenvk)
         set(_rexglue_vulkan_loader rex::vulkan-loader)
         set(_rexglue_moltenvk rex::moltenvk)

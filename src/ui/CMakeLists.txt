@@ -13,6 +13,7 @@ set(REXUI_CORE_SOURCES
     presenter.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
+    surface_sdl.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -63,6 +64,11 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
+set(REXUI_GLES_SOURCES
+    gles/presenter.cpp
+    gles/provider.cpp
+)
+
 # Platform-specific sources (windowing itself is SDL3, platform-independent)
 if(WIN32)
     set(REXUI_PLATFORM_SOURCES
@@ -91,6 +97,10 @@ endif()
 
 if(REXGLUE_USE_D3D12)
     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
+endif()
+
+if(REXGLUE_USE_GLES)
+    list(APPEND REXUI_SOURCES ${REXUI_GLES_SOURCES})
 endif()
 
 add_library(rexui OBJECT ${REXUI_SOURCES})
@@ -143,6 +153,10 @@ if(REXGLUE_USE_VULKAN)
         GPUOpen::VulkanMemoryAllocator
         spirv-tools-headers
     )
+endif()
+
+if(REXGLUE_USE_GLES AND SDL_OPENGLES)
+    target_compile_definitions(rexui PUBLIC REX_HAS_GLES=1)
 endif()
 
 # Platform-specific dependencies

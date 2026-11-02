@@ -236,9 +236,10 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
     REXSYS_DEBUG("Registered {} recompiled functions ({} duplicates, {} rejected)", count,
                  duplicates, rejected);
     if (rejected > 0) {
-      REXSYS_ERROR("PPCImageInfo registration: {} func_mappings entries rejected", rejected);
-      Shutdown();
-      return X_STATUS_UNSUCCESSFUL;
+      // An out-of-range mapping can never be reached by guest execution, so it
+      // must not take the whole image down: report and continue.
+      REXSYS_WARN("PPCImageInfo registration: {} out-of-range func_mappings entries skipped",
+                  rejected);
     }
   }
 

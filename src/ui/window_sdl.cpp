@@ -40,6 +40,8 @@
 #include <rex/ui/surface_gnulinux.h>
 #endif
 
+#include <rex/ui/surface_sdl.h>
+
 namespace rex::ui {
 
 namespace {
@@ -137,6 +139,23 @@ bool WindowSDL::OpenImpl() {
   // SDL window coordinates are physical pixels on Windows and X11. Cocoa
   // uses logical points and applies the backing scale itself.
   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+#if REX_HAS_GLES
+  // SDL requires the OpenGL flag at window creation time for
+  // SDL_GL_CreateContext to succeed, and it selects the EGL config based on the
+  // context attributes present when the window is created - so request the
+  // OpenGL ES 3.1 config here, before the presenter makes the context.
+  if (REXCVAR_GET(gpu_backend) == "gles") {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    // 3.0 selects the ES3 EGL config; the presenter requests 3.1 and falls back
+    // to 3.0 when creating the actual context.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+    flags |= SDL_WINDOW_OPENGL;
+  }
+#endif
 #if REX_PLATFORM_MAC
   int initial_width = int(GetDesiredLogicalWidth());
   int initial_height = int(GetDesiredLogicalHeight());
@@ -239,6 +258,8 @@ void* WindowSDL::GetNativeWindowHandle() const {
   return nullptr;
 #endif
 }
+
+void* WindowSDL::GetSDLWindowHandle() const { return sdl_window_; }
 
 bool WindowSDL::SetRelativeMouseMode(bool enable) {
   if (!sdl_window_) {
@@ -419,6 +440,11 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #endif
+  // Backends that manage their own host context (GLES) need only the SDL
+  // window; this also covers KMSDRM, which has no platform-native surface.
+  if (allowed_types & Surface::kTypeFlag_SDLWindow) {
+    return std::make_unique<SDLWindowSurface>(sdl_window_);
+  }
   return nullptr;
 }
 

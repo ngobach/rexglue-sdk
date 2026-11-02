@@ -335,6 +335,8 @@ void VdInitializeRingBuffer_entry(mapped_void ptr, i32 size_log2) {
     WarnNoGpuEmulation("VdInitializeRingBuffer", warned);
     return;
   }
+  REXLOG_INFO("VdInitializeRingBuffer(ptr={:08X}, size_log2={})", ptr.guest_address(),
+              size_log2);
   graphics_system->InitializeRingBuffer(ptr.guest_address(), size_log2);
 }
 
@@ -346,6 +348,8 @@ void VdEnableRingBufferRPtrWriteBack_entry(mapped_void ptr, i32 block_size_log2)
     WarnNoGpuEmulation("VdEnableRingBufferRPtrWriteBack", warned);
     return;
   }
+  REXLOG_INFO("VdEnableRingBufferRPtrWriteBack(ptr={:08X}, block_size_log2={})",
+              ptr.guest_address(), block_size_log2);
   graphics_system->EnableReadPointerWriteBack(ptr.guest_address(), block_size_log2);
 }
 

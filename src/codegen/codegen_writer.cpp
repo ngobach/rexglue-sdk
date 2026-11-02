@@ -40,6 +40,13 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
                                  const std::unordered_map<uint32_t, std::string>& rexcrtByAddr) {
   const auto& cfg = ctx.Config();
 
+  // Functions whose base falls outside the loaded image cannot be executed:
+  // data scanned as code pointers can produce bases in unused or kernel space.
+  // Emitting mappings for them makes the runtime reject the whole function
+  // table at setup.
+  const uint64_t image_base = ctx.binary().baseAddress();
+  const uint64_t image_end = image_base + ctx.binary().imageSize();
+
   // Compute code_base and code_size from binary sections
   size_t codeMin = ~size_t(0);
   size_t codeMax = 0;
@@ -55,15 +62,23 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
   // Build functions JSON array
   nlohmann::json functionsJson = nlohmann::json::array();
   for (const auto* fn : functions) {
+    if (fn->base() < image_base || fn->base() >= image_end) {
+      continue;
+    }
+
     std::string funcName;
     bool isRexcrt = false;
+    const bool isImport = fn->authority() == rex::codegen::FunctionAuthority::IMPORT;
 
     auto crtIt = rexcrtByAddr.find(static_cast<uint32_t>(fn->base()));
     if (crtIt != rexcrtByAddr.end()) {
       funcName = crtIt->second;
       isRexcrt = true;
-    } else if (fn->base() == ctx.analysisState().entryPoint) {
-      funcName = "xstart";
+    } else if (isImport) {
+      // Import thunks get a recompiled wrapper at the guest address so calls
+      // through function pointers (runtime dispatch tables) resolve too. The
+      // wrapper body forwards to the resolved __imp__ HLE function.
+      funcName = fmt::format("sub_{:08X}", fn->base());
     } else if (!fn->name().empty()) {
       funcName = fn->name();
     } else {
@@ -75,7 +90,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
         {"name", funcName},
         {"is_rexcrt", isRexcrt},
         {"below_code_base", (fn->base() < codeMin)},
-        {"is_import", fn->authority() == rex::codegen::FunctionAuthority::IMPORT},
+        {"is_import", isImport},
     });
   }
 
@@ -236,13 +251,15 @@ bool CodegenWriter::write(bool force) {
   out = renderWithJson(registry, "codegen/register_cpp", tmplData);
   SaveCurrentOutData(fmt::format("{}_register.cpp", projectName));
 
-  // Filter out imports and rexcrt functions before recompilation
-  std::erase_if(functions, [](const FunctionNode* fn) {
-    return fn->authority() == FunctionAuthority::IMPORT;
-  });
+  // Filter out rexcrt functions before recompilation. Imports are kept: they
+  // are emitted as thin wrappers so indirect calls reach the HLE function.
   std::erase_if(functions, [&rexcrtByAddr](const FunctionNode* fn) {
     return rexcrtByAddr.contains(static_cast<uint32_t>(fn->base()));
   });
+  // Note: functions outside the image are kept here on purpose. They are
+  // excluded from PPCFuncMappings (see buildTemplateData) but their call sites
+  // still reference symbols, so they need stub bodies to link. Their bodies are
+  // empty prologues until the analysis is fixed.
 
   // Build EmitContext -- resolver is now properly connected
   EmitContext emitCtx{binary(), config(), graph(),
@@ -264,7 +281,24 @@ bool CodegenWriter::write(bool force) {
   emitCtx.referenced = &referenced;
   for (const auto* fn : functions) {
     referenced.clear();
-    std::string code = fn->emitCpp(emitCtx);
+    std::string code;
+    if (fn->authority() == FunctionAuthority::IMPORT) {
+      const std::string wrapperName = fmt::format("sub_{:08X}", fn->base());
+      const std::string targetName = std::string(fn->name());
+      if (targetName.rfind("__imp__", 0) == 0) {
+        code = fmt::format(
+            "DEFINE_REX_FUNC({}) {{\n\tREX_FUNC_PROLOGUE();\n\t{}(ctx, base);\n}}\n",
+            wrapperName, targetName);
+        referenced.insert(targetName);
+      } else {
+        code = fmt::format(
+            "DEFINE_REX_FUNC({}) {{\n\tREX_FUNC_PROLOGUE();\n\tREX_FATAL(\"Unresolved "
+            "import at guest address 0x{:08X}\");\n}}\n",
+            wrapperName, fn->base());
+      }
+    } else {
+      code = fn->emitCpp(emitCtx);
+    }
     if (code.size() > maxFileBytes) {
       REXCODEGEN_WARN("Function 0x{:08X} is {} bytes, exceeds max_file_size_bytes ({})", fn->base(),
                       code.size(), maxFileBytes);
@@ -290,6 +324,11 @@ bool CodegenWriter::write(bool force) {
     println("#pragma once\n");
     println("#include \"{}_pch.h\"\n", projectName);
     for (const auto& name : ordered) {
+      if (name.empty()) {
+        // Defensive: a reference without a resolved symbol name would emit an
+        // invalid declaration (DECLARE_REX_FUNC()).
+        continue;
+      }
       println("DECLARE_REX_FUNC({});", name);
     }
     SaveCurrentOutData(fmt::format("{}_funcs.{}.h", projectName, index));

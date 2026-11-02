@@ -28,6 +28,9 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/thread.h>
+
+#include <fmt/format.h>
 
 #include <ucontext.h>
 
@@ -417,6 +420,20 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // No handler claimed the exception. Returning from the signal handler would
+  // simply retry the faulting instruction and take the same fault again, so the
+  // thread would spin forever at full speed with no diagnostics. Surface it.
+  if (ex.code() == Exception::Code::kAccessViolation) {
+    rex::FatalError(fmt::format(
+        "Unhandled access violation: pc 0x{:016X} address 0x{:016X} ({}), thread 0x{:X}",
+        thread_context.pc, ex.fault_address(),
+        ex.access_violation_operation() == Exception::AccessViolationOperation::kWrite ? "write"
+                                                                                        : "read",
+        rex::thread::current_thread_id()));
+  }
+  rex::FatalError(fmt::format("Unhandled host exception: pc 0x{:016X}, thread 0x{:X}",
+                              thread_context.pc, rex::thread::current_thread_id()));
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -240,6 +241,14 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    {
+      static std::atomic<uint32_t> exec_count{0};
+      uint32_t exec_index = exec_count.fetch_add(1, std::memory_order_relaxed);
+      if (exec_index < 10 || (exec_index % 600) == 0) {
+        REXLOG_INFO("GPU CP executed #{}: read={:08X} write={:08X}", exec_index,
+                    read_ptr_index_, write_ptr_index);
+      }
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -328,6 +337,11 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
+  static std::atomic<uint32_t> kick_count{0};
+  uint32_t kick_index = kick_count.fetch_add(1, std::memory_order_relaxed);
+  if (kick_index < 10 || (kick_index % 600) == 0) {
+    REXLOG_INFO("GPU WPTR kick #{}: {:08X} (read {:08X})", kick_index, value, read_ptr_index_);
+  }
   write_ptr_index_ = value;
   write_ptr_index_event_->Set();
 }

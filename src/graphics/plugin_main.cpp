@@ -20,6 +20,9 @@
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
+#if REX_HAS_GLES
+#include <rex/graphics/gles/graphics_system.h>
+#endif
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
   return rex::system::kGpuPluginAbiVersion;
@@ -46,6 +49,11 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
 #if REX_HAS_VULKAN
   if (backend == "any" || backend == "vulkan") {
     return new rex::graphics::vulkan::VulkanGraphicsSystem();
+  }
+#endif
+#if REX_HAS_GLES
+  if (backend == "gles") {
+    return new rex::graphics::gles::GlesGraphicsSystem();
   }
 #endif
   REXLOG_ERROR("rexgpu-xenos: requested backend '{}' is not compiled into this plugin", backend);

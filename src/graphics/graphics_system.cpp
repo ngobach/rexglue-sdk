@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <functional>
@@ -265,6 +266,12 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
 void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   uint32_t r = (addr & 0xFFFF) / 4;
 
+  static std::atomic<uint32_t> write_count{0};
+  uint32_t write_index = write_count.fetch_add(1, std::memory_order_relaxed);
+  if (write_index < 20 || (write_index % 1000) == 0) {
+    REXLOG_INFO("GPU reg write #{:04X} = {:08X} (addr {:08X})", r, value, addr);
+  }
+
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
@@ -297,6 +304,13 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data)
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   if (!interrupt_callback_) {
     return;
+  }
+
+  static std::atomic<uint32_t> dispatch_count{0};
+  uint32_t dispatch_index = dispatch_count.fetch_add(1, std::memory_order_relaxed);
+  if (dispatch_index < 3 || (dispatch_index % 600) == 0) {
+    REXLOG_INFO("DispatchInterruptCallback #{}(source={}, cpu={}) -> {:08X}", dispatch_index,
+                source, cpu, interrupt_callback_);
   }
 
   auto thread = system::XThread::GetCurrentThread();

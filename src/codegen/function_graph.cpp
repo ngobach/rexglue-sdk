@@ -358,9 +358,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     REXCODEGEN_WARN("Function 0x{:08X} has no blocks - generating stub", base());
 
     std::string name;
-    if (base() == ctx.entryPoint) {
-      name = "xstart";
-    } else if (!name_.empty()) {
+    if (!name_.empty()) {
       name = name_;
     } else {
       name = fmt::format("sub_{:08X}", base());
@@ -470,9 +468,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   // --- Function name ---
   std::string name;
-  if (base() == ctx.entryPoint) {
-    name = "xstart";
-  } else if (!name_.empty()) {
+  if (!name_.empty()) {
     name = name_;
   } else {
     name = fmt::format("sub_{:08X}", base());
@@ -600,6 +596,44 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
       blockBase += 4;
       ++data;
+    }
+
+    // A manifest entry can split a straight-line region in two. If the block
+    // ends without a terminator, execution falls through into whatever function
+    // starts at the next address. Emit that tail call explicitly; otherwise the
+    // generated C++ function silently returns and the next function's prologue
+    // is skipped (corrupting callee-saved registers and the guest stack).
+    if (blockEnd > block.base && blockEnd == blockBase) {
+      const uint32_t last = load_and_swap<uint32_t>(
+          reinterpret_cast<const uint8_t*>(ctx.binary.translate(blockEnd - 4)));
+      const uint32_t lastOp = last >> 26;
+      const bool terminates = (lastOp == 18 && !(last & 1)) ||  // b
+                              last == 0x4E800020 ||            // blr
+                              last == 0x4E800420;              // bctr
+      bool ownsNext = false;
+      for (const auto& other : blocks_) {
+        if (other.base == blockEnd) {
+          ownsNext = true;
+          break;
+        }
+      }
+      if (!terminates && !ownsNext) {
+        const FunctionNode* nextFn = ctx.graph.getFunction(blockEnd);
+        if (nextFn && nextFn != this && !nextFn->name().empty()) {
+          ctx.reference(nextFn->name());
+          emit_println(body, "\t{}(ctx, base);", nextFn->name());
+          emit_println(body, "\treturn;");
+        } else if (nextFn && nextFn != this && nextFn->isImport()) {
+          ctx.reference(nextFn->name());
+          emit_println(body, "\t{}(ctx, base);", nextFn->name());
+          emit_println(body, "\treturn;");
+        } else if (nextFn && nextFn != this) {
+          emit_println(
+              body,
+              "\tREX_FATAL(\"Fallthrough from 0x{:08X} to unregistered 0x{:08X}\");",
+              base(), blockEnd);
+        }
+      }
     }
   }
 

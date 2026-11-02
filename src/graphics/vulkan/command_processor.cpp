@@ -3990,6 +3990,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+      {
+        static uint32_t logged = 0;
+        if (logged < 6) {
+          ++logged;
+          const uint32_t* first = reinterpret_cast<const uint32_t*>(
+              memory_->TranslatePhysical(vfetch_constant.address << 2));
+          REXGPU_INFO(
+              "VK vfetch: fc={} type={} addr=0x{:08X} size={} data=[{:08X} {:08X} {:08X} {:08X}]",
+              vfetch_index, uint32_t(vfetch_constant.type), vfetch_constant.address << 2,
+              uint32_t(vfetch_constant.size), first[0], first[1], first[2], first[3]);
+        }
+      }
       switch (vfetch_constant.type) {
         case xenos::FetchConstantType::kVertex:
           break;
@@ -5702,6 +5714,22 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor_rect.extent.width = scissor.extent[0];
   scissor_rect.extent.height = scissor.extent[1];
   SetScissor(scissor_rect);
+
+  if (getenv("VK_LOG_DRAWS")) {
+    static uint32_t logged = 0;
+    if (logged < 4000) {
+      ++logged;
+      fprintf(stderr,
+              "VKDRAW viewport=(%g,%g %gx%g) scissor=(%d,%d %ux%u) ndc_scale=(%g,%g,%g) "
+              "ndc_offset=(%g,%g,%g) z=(%g..%g)\n",
+              viewport.x, viewport.y, viewport.width, viewport.height, scissor_rect.offset.x,
+              scissor_rect.offset.y, scissor_rect.extent.width, scissor_rect.extent.height,
+              viewport_info.ndc_scale[0], viewport_info.ndc_scale[1], viewport_info.ndc_scale[2],
+              viewport_info.ndc_offset[0], viewport_info.ndc_offset[1],
+              viewport_info.ndc_offset[2], viewport.minDepth, viewport.maxDepth);
+      fflush(stderr);
+    }
+  }
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     // Depth bias.

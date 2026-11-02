@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -25,6 +26,59 @@ class SpirvShader : public Shader {
    public:
     explicit SpirvTranslation(SpirvShader& shader, uint64_t modification)
         : Translation(shader, modification) {}
+
+    // ES 3.0 vertex memory textures for this translation (names and the fetch
+    // constant each one backs, or the index buffer). Modification-dependent
+    // because the index buffer texture is only created when the shader can load
+    // indices.
+    struct VertexMemorySampler {
+      uint32_t fetch_constant;
+      std::string name;
+      bool is_index;
+      // Non-zero when the vertex stage reads it from a plain uniform array of
+      // this many dwords instead of a texture.
+      uint32_t uniform_count;
+    };
+    const std::vector<VertexMemorySampler>& vertex_memory_samplers() const {
+      return vertex_memory_samplers_;
+    }
+    std::vector<VertexMemorySampler>& vertex_memory_samplers_mutable() {
+      return vertex_memory_samplers_;
+    }
+
+    // Texture and sampler bindings for this modification. Unlike the
+    // modification-independent lists on the Shader, these are filled per
+    // translation, so backends that link individual translations can rely on
+    // them (dead-code elimination may differ between modifications).
+    struct TextureBinding {
+      uint32_t fetch_constant;
+      xenos::FetchOpDimension dimension;
+      bool is_signed;
+    };
+    struct SamplerBinding {
+      uint32_t fetch_constant;
+      xenos::TextureFilter mag_filter;
+      xenos::TextureFilter min_filter;
+      xenos::TextureFilter mip_filter;
+      xenos::AnisoFilter aniso_filter;
+    };
+    const std::vector<TextureBinding>& translation_texture_bindings() const {
+      return translation_texture_bindings_;
+    }
+    std::vector<TextureBinding>& translation_texture_bindings_mutable() {
+      return translation_texture_bindings_;
+    }
+    const std::vector<SamplerBinding>& translation_sampler_bindings() const {
+      return translation_sampler_bindings_;
+    }
+    std::vector<SamplerBinding>& translation_sampler_bindings_mutable() {
+      return translation_sampler_bindings_;
+    }
+
+   private:
+    std::vector<VertexMemorySampler> vertex_memory_samplers_;
+    std::vector<TextureBinding> translation_texture_bindings_;
+    std::vector<SamplerBinding> translation_sampler_bindings_;
   };
 
   explicit SpirvShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
@@ -58,6 +112,19 @@ class SpirvShader : public Shader {
     return sampler_bindings_;
   }
 
+  // ES 3.0 vertex memory texture uniform (per vertex fetch constant, or the
+  // index buffer when is_index is true).
+  struct VertexMemorySamplerBinding {
+    uint32_t fetch_constant;
+    std::string name;
+    bool is_index;
+    uint32_t uniform_count;
+  };
+  const std::vector<VertexMemorySamplerBinding>& GetVertexMemorySamplersAfterTranslation()
+      const {
+    return vertex_memory_samplers_;
+  }
+
  protected:
   Translation* CreateTranslationInstance(uint64_t modification) override;
 
@@ -67,6 +134,7 @@ class SpirvShader : public Shader {
   std::atomic_flag bindings_setup_entered_ = ATOMIC_FLAG_INIT;
   std::vector<TextureBinding> texture_bindings_;
   std::vector<SamplerBinding> sampler_bindings_;
+  std::vector<VertexMemorySamplerBinding> vertex_memory_samplers_;
   uint32_t used_texture_mask_ = 0;
 };
 

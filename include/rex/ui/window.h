@@ -290,6 +290,10 @@ class Window {
   /// Valid after Open() returns successfully.
   virtual void* GetNativeWindowHandle() const { return nullptr; }
 
+  /// Returns the SDL_Window* backing this window, or nullptr. For presenters
+  /// that create their own host context through SDL (OpenGL ES).
+  virtual void* GetSDLWindowHandle() const { return nullptr; }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   void SetMainMenu(std::unique_ptr<MenuItem> new_main_menu);

@@ -123,7 +123,10 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
     // P705), however, words (not full elements) out of glBufferData bounds
     // contain 0.
-    word_composite_constituents[word_count++] = LoadUint32FromSharedMemory(word_address);
+    word_composite_constituents[word_count++] =
+        features_.shared_memory_via_textures
+            ? LoadUint32FromVertexFetchMemory(word_address, instr.operands[1].storage_index)
+            : LoadUint32FromSharedMemory(word_address);
   }
   spv::Id words;
   if (word_count > 1) {
@@ -569,7 +572,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     while (rex::bit_scan_forward(derivative_components_remaining, &derivative_component_index)) {
       derivative_components_remaining &= ~(UINT32_C(1) << derivative_component_index);
       result[derivative_component_index] = builder_->createUnaryOp(
-          (derivative_component_index & 0b01) ? spv::OpDPdyCoarse : spv::OpDPdxCoarse, type_float_,
+          features_.derivative_control
+              ? ((derivative_component_index & 0b01) ? spv::OpDPdyCoarse : spv::OpDPdxCoarse)
+              : ((derivative_component_index & 0b01) ? spv::OpDPdy : spv::OpDPdx),
+          type_float_,
           (derivative_component_index & 0b10) ? derivative_function_y : derivative_function_x);
     }
   } else {

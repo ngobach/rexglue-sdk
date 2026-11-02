@@ -31,6 +31,10 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
     .range(0, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Backend inside the GPU plugin: 'any', 'vulkan', 'd3d12' or 'gles'")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 // kHotReload (default): Window::SetFullscreen can be applied live, so the
 // change callback registered in ReXApp::SetupPresentation keeps the window
 // in sync whenever this cvar is changed at runtime.

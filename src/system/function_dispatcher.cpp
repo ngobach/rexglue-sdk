@@ -35,6 +35,13 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 }  // namespace
 
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+  // TEMP boot diagnostic: report the call site and argument registers so the
+  // unpopulated function pointer can be traced back to its structure.
+  REXLOG_ERROR(
+      "invalid indirect call: target={:08X} lr={:08X} r1={:08X} r3={:08X} r4={:08X} "
+      "r5={:08X} r6={:08X} r7={:08X} r11={:08X} r13={:08X}",
+      ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32,
+      ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r11.u32, ctx.r13.u32);
   REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
             ctx.last_indirect_target);
 }

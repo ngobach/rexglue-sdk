@@ -279,9 +279,16 @@ set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 set(SDL_TRAY OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 
-# Disable graphics APIs (unused without video) — only on non-Apple
+# Only on non-Apple.
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
-set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+if(REXGLUE_USE_GLES AND UNIX)
+    # SDL creates the OpenGL ES context through EGL. On Linux that is Mesa
+    # (EGL/GBM/X11/Wayland); on macOS it is ANGLE, which must be present as
+    # libEGL.dylib + libGLESv2.dylib next to the executable.
+    set(SDL_OPENGLES ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+endif()
 
 # Disable dummy drivers
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
@@ -302,6 +309,48 @@ if(UNIX AND NOT APPLE)
 endif()
 
 add_subdirectory(sdl3)
+
+#=============================================================================
+# SPIRV-Cross (SPIR-V -> GLSL ES for the GLES backend)
+#=============================================================================
+if(REXGLUE_USE_GLES)
+    # SPIRV-Cross is consumed as a plain source tree because MoltenVK may have
+    # already defined the same CMake targets (with its own namespace) when the
+    # Vulkan backend is enabled on Apple.
+    include(FetchContent)
+    set(REX_SPIRV_CROSS_REVISION "vulkan-sdk-1.4.328.1" CACHE STRING
+        "SPIRV-Cross revision used for GLSL ES generation")
+    FetchContent_Declare(
+        rex_spirv_cross
+        GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+        GIT_TAG ${REX_SPIRV_CROSS_REVISION}
+        GIT_SHALLOW FALSE
+        SOURCE_SUBDIR spirv-cross-cmake-disabled
+    )
+    FetchContent_GetProperties(rex_spirv_cross)
+    if(NOT rex_spirv_cross_POPULATED)
+        FetchContent_Populate(rex_spirv_cross)
+    endif()
+    add_library(rex-spirv-cross STATIC
+        ${rex_spirv_cross_SOURCE_DIR}/spirv_cross.cpp
+        ${rex_spirv_cross_SOURCE_DIR}/spirv_cross_parsed_ir.cpp
+        ${rex_spirv_cross_SOURCE_DIR}/spirv_cross_util.cpp
+        ${rex_spirv_cross_SOURCE_DIR}/spirv_cfg.cpp
+        ${rex_spirv_cross_SOURCE_DIR}/spirv_parser.cpp
+        ${rex_spirv_cross_SOURCE_DIR}/spirv_glsl.cpp
+    )
+    # Avoid clashing with the copy MoltenVKShaderConverter may have built.
+    target_compile_definitions(rex-spirv-cross
+        PUBLIC SPIRV_CROSS_NAMESPACE_OVERRIDE=rex_spirv_cross)
+    target_include_directories(rex-spirv-cross
+        PUBLIC $<BUILD_INTERFACE:${rex_spirv_cross_SOURCE_DIR}>)
+    set_target_properties(rex-spirv-cross PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden)
+    if(NOT MSVC)
+        target_compile_options(rex-spirv-cross PRIVATE -w)
+    endif()
+endif()
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)

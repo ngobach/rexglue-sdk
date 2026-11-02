@@ -12,6 +12,8 @@
 #include "codegen_flags.h"
 #include "ppc/instruction.h"
 
+#include <cstdlib>
+
 #include <rex/codegen/phases.h>
 #include "phase_helpers.h"
 
@@ -588,10 +590,41 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
   size_t count = pdataSize / sizeof(IMAGE_CE_RUNTIME_FUNCTION);
   auto* entries = reinterpret_cast<const IMAGE_CE_RUNTIME_FUNCTION*>(pdataData);
 
+  // TEMP EXPERIMENT: allow skipping the PDATA table entirely.
+  const bool skipPdata = std::getenv("REX_SKIP_PDATA") != nullptr;
+
   size_t pdataAdded = 0;
+  size_t pdataDropped = 0;
+
+  // TEMP EXPERIMENT: this title's .pdata stops matching .text partway through
+  // the image, so entries there name mid-function addresses. Dropping those
+  // lets discovery rebuild the real function table from the code.
+  const bool checkPdataPrologues = std::getenv("REX_PDATA_PROLOGUE_CHECK") != nullptr;
+  auto looksLikeFunctionStart = [&](uint32_t addr) {
+    const uint32_t* insn = reinterpret_cast<const uint32_t*>(binary.translate(addr));
+    if (!insn)
+      return false;
+    uint32_t raw = byte_swap(*insn);
+    if ((raw & 0xFC1FFFFEu) == 0x7C0802A6u)  // mflr rS
+      return true;
+    uint32_t op = raw >> 26;
+    if (op == 37)  // stwu
+      return true;
+    if (op == 18)  // b / bl (thunks)
+      return true;
+    return false;
+  };
+
   for (size_t i = 0; i < count; i++) {
+    if (skipPdata)
+      break;
     uint32_t beginAddr = byte_swap(entries[i].BeginAddress);
     uint32_t data = byte_swap(entries[i].Data);
+
+    if (checkPdataPrologues && !looksLikeFunctionStart(beginAddr)) {
+      ++pdataDropped;
+      continue;
+    }
 
     IMAGE_CE_RUNTIME_FUNCTION fn;
     fn.BeginAddress = beginAddr;
@@ -674,6 +707,10 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
   }
 
   REXCODEGEN_TRACE("Analyze: added {} functions from PDATA", pdataAdded);
+  if (pdataDropped > 0) {
+    REXCODEGEN_WARN("Analyze: dropped {} PDATA entries whose BeginAddress is not a function start",
+                    pdataDropped);
+  }
 
   // Queue EH-discovered functions
   size_t ehFuncsQueued = 0;

@@ -620,6 +620,10 @@ class Presenter {
   explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
       : host_gpu_loss_callback_(host_gpu_loss_callback) {}
 
+  // The window the presenter is attached to, for backends that need its host
+  // handle (for example, to create an SDL OpenGL context).
+  Window* window_from_ui_thread() const { return window_; }
+
   // Must be called by the implementation's initialization, before the presenter
   // is used for anything.
   bool InitializeCommonSurfaceIndependent();

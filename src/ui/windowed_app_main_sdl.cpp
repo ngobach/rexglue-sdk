@@ -22,6 +22,10 @@
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
+#if REX_PLATFORM_MAC
+#include <mach/mach.h>
+#endif
+
 #if REX_PLATFORM_WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -127,6 +131,18 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
 #else
 
 int main(int argc, char* argv[]) {
+#if REX_PLATFORM_MAC
+  // A shell/debugger hosting the game may leave a Mach exception port for
+  // EXC_BAD_ACCESS (and the other hardware faults) in place, and children
+  // inherit it. While such a port exists the kernel never raises SIGSEGV: the
+  // exception is delivered to the port instead, the faulting instruction is
+  // retried without the page becoming accessible, and the emulator's MMIO and
+  // write-watch handling silently spins. The runtime handles these faults as
+  // signals, so drop any inherited hardware-exception ports.
+  task_set_exception_ports(mach_task_self(),
+                           EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_ARITHMETIC,
+                           MACH_PORT_NULL, EXCEPTION_DEFAULT, 0);
+#endif
   return RunWindowedApp(argc, argv);
 }
 

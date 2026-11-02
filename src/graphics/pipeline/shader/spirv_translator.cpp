@@ -111,6 +111,7 @@ void SpirvShaderTranslator::Reset() {
   builder_.reset();
 
   uniform_float_constants_ = spv::NoResult;
+  vertex_memory_samplers_.clear();
 
   input_vertex_index_ = spv::NoResult;
   input_primitive_id_ = spv::NoResult;
@@ -326,7 +327,7 @@ void SpirvShaderTranslator::StartTranslation() {
   builder_->addDecoration(type_system_constants, spv::DecorationBlock);
   uniform_system_constants_ =
       builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform, type_system_constants,
-                               "xe_uniform_system_constants");
+                               fmt::format("xe_uniform_system_constants_{}", is_pixel_shader() ? "ps" : "vs").c_str());
   builder_->addDecoration(uniform_system_constants_, spv::DecorationDescriptorSet,
                           int(kDescriptorSetConstants));
   builder_->addDecoration(uniform_system_constants_, spv::DecorationBinding,
@@ -349,13 +350,14 @@ void SpirvShaderTranslator::StartTranslation() {
       // needs to be applied explicitly.
       builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
                               sizeof(float) * 4);
-      spv::Id type_float_constants = builder_->makeStructType(id_vector_temp_, "XeFloatConstants");
+      spv::Id type_float_constants = builder_->makeStructType(
+          id_vector_temp_, is_pixel_shader() ? "XeFloatConstantsPixel" : "XeFloatConstantsVertex");
       builder_->addMemberName(type_float_constants, 0, "float_constants");
       builder_->addMemberDecoration(type_float_constants, 0, spv::DecorationOffset, 0);
       builder_->addDecoration(type_float_constants, spv::DecorationBlock);
       uniform_float_constants_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform, type_float_constants,
-                                   "xe_uniform_float_constants");
+                                   fmt::format("xe_uniform_float_constants_{}", is_pixel_shader() ? "ps" : "vs").c_str());
       builder_->addDecoration(uniform_float_constants_, spv::DecorationDescriptorSet,
                               int(kDescriptorSetConstants));
       builder_->addDecoration(
@@ -391,7 +393,7 @@ void SpirvShaderTranslator::StartTranslation() {
     builder_->addDecoration(type_bool_loop_constants, spv::DecorationBlock);
     uniform_bool_loop_constants_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform,
-                                 type_bool_loop_constants, "xe_uniform_bool_loop_constants");
+                                 type_bool_loop_constants, fmt::format("xe_uniform_bool_loop_constants_{}", is_pixel_shader() ? "ps" : "vs").c_str());
     builder_->addDecoration(uniform_bool_loop_constants_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetConstants));
     builder_->addDecoration(uniform_bool_loop_constants_, spv::DecorationBinding,
@@ -413,7 +415,7 @@ void SpirvShaderTranslator::StartTranslation() {
     builder_->addDecoration(type_fetch_constants, spv::DecorationBlock);
     uniform_fetch_constants_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform, type_fetch_constants,
-                                 "xe_uniform_fetch_constants");
+                                 fmt::format("xe_uniform_fetch_constants_{}", is_pixel_shader() ? "ps" : "vs").c_str());
     builder_->addDecoration(uniform_fetch_constants_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetConstants));
     builder_->addDecoration(uniform_fetch_constants_, spv::DecorationBinding,
@@ -422,8 +424,34 @@ void SpirvShaderTranslator::StartTranslation() {
       main_interface_.push_back(uniform_fetch_constants_);
     }
 
+    // Vertex-stage guest memory as plain uniform arrays (ES 3.0 on drivers that
+    // can't sample textures in the vertex stage). Declared up front because
+    // plain uniforms have to be module-scope variables; the fetch constants
+    // they serve are only known once the shader instructions are translated.
+    uniform_vertex_memory_count_ = 0;
+    uniform_index_memory_ = spv::NoResult;
+    if (features_.vertex_memory_uniforms && is_vertex_shader()) {
+      spv::Id array_type = builder_->makeArrayType(
+          type_uint_, builder_->makeUintConstant(Features::kVertexMemoryUniformCount),
+          sizeof(uint32_t));
+      builder_->addDecoration(array_type, spv::DecorationArrayStride, sizeof(uint32_t));
+      for (uint32_t i = 0; i < kMaxVertexMemoryUniformArrays; ++i) {
+        uniform_vertex_memory_[i] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassUniform, array_type,
+            fmt::format("xe_vfetch_data_{}", i).c_str());
+        // SPIRV-Cross only emits bare (non-block) uniforms that are in the entry
+        // point interface, regardless of the SPIR-V version.
+        main_interface_.push_back(uniform_vertex_memory_[i]);
+      }
+      uniform_index_memory_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform, array_type,
+                                   "xe_index_data");
+      main_interface_.push_back(uniform_index_memory_);
+    }
+
     // Common storage buffers - shared memory uint[], each 128 MB or larger,
     // depending on what's possible on the device.
+    if (!features_.shared_memory_via_textures) {
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
     // Storage buffers have std430 packing, no padding to 4-component vectors.
@@ -453,6 +481,7 @@ void SpirvShaderTranslator::StartTranslation() {
     builder_->addDecoration(buffers_shared_memory_, spv::DecorationBinding, 0);
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffers_shared_memory_);
+    }
     }
   }
 
@@ -1260,6 +1289,27 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
 
 void SpirvShaderTranslator::PostTranslation() {
   Shader::Translation& translation = current_translation();
+  {
+    static uint64_t logged_hashes[32] = {};
+    static uint32_t logged_hash_count = 0;
+    bool already_logged = false;
+    for (uint32_t i = 0; i < logged_hash_count; ++i) {
+      if (logged_hashes[i] == translation.shader().ucode_data_hash()) {
+        already_logged = true;
+        break;
+      }
+    }
+    if (!already_logged && logged_hash_count < 32) {
+      logged_hashes[logged_hash_count++] = translation.shader().ucode_data_hash();
+      fprintf(stderr, "TRANSLATED shader %016llX textures=%zu samplers=%zu\n",
+              static_cast<unsigned long long>(translation.shader().ucode_data_hash()),
+              texture_bindings_.size(), sampler_bindings_.size());
+      for (const TextureBinding& binding : texture_bindings_) {
+        fprintf(stderr, "  texture fc=%u dim=%u signed=%u\n", binding.fetch_constant,
+                uint32_t(binding.dimension), uint32_t(binding.is_signed));
+      }
+    }
+  }
   if (!translation.is_valid()) {
     return;
   }
@@ -1286,6 +1336,42 @@ void SpirvShaderTranslator::PostTranslation() {
       shader_binding.min_filter = translator_binding.min_filter;
       shader_binding.mip_filter = translator_binding.mip_filter;
       shader_binding.aniso_filter = translator_binding.aniso_filter;
+    }
+  }
+  if (SpirvShader::SpirvTranslation* spirv_translation =
+          dynamic_cast<SpirvShader::SpirvTranslation*>(&translation)) {
+    auto& translation_textures = spirv_translation->translation_texture_bindings_mutable();
+    translation_textures.clear();
+    translation_textures.reserve(texture_bindings_.size());
+    for (const TextureBinding& translator_binding : texture_bindings_) {
+      SpirvShader::SpirvTranslation::TextureBinding& texture = translation_textures.emplace_back();
+      texture.fetch_constant = translator_binding.fetch_constant;
+      texture.dimension = translator_binding.dimension;
+      texture.is_signed = translator_binding.is_signed;
+    }
+    auto& translation_sampler_bindings =
+        spirv_translation->translation_sampler_bindings_mutable();
+    translation_sampler_bindings.clear();
+    translation_sampler_bindings.reserve(sampler_bindings_.size());
+    for (const SamplerBinding& translator_binding : sampler_bindings_) {
+      SpirvShader::SpirvTranslation::SamplerBinding& sampler =
+          translation_sampler_bindings.emplace_back();
+      sampler.fetch_constant = translator_binding.fetch_constant;
+      sampler.mag_filter = translator_binding.mag_filter;
+      sampler.min_filter = translator_binding.min_filter;
+      sampler.mip_filter = translator_binding.mip_filter;
+      sampler.aniso_filter = translator_binding.aniso_filter;
+    }
+    auto& translation_samplers = spirv_translation->vertex_memory_samplers_mutable();
+    translation_samplers.clear();
+    translation_samplers.reserve(vertex_memory_samplers_.size());
+    for (const VertexMemorySampler& translator_binding : vertex_memory_samplers_) {
+      SpirvShader::SpirvTranslation::VertexMemorySampler& sampler =
+          translation_samplers.emplace_back();
+      sampler.fetch_constant = translator_binding.fetch_constant;
+      sampler.name = translator_binding.name;
+      sampler.is_index = translator_binding.is_index;
+      sampler.uniform_count = translator_binding.uniform_count;
     }
   }
 }
@@ -1680,7 +1766,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
       interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
       spv::Id interpolator = builder_->createVariable(
           spv::NoPrecision, spv::StorageClassOutput, type_float4_,
-          fmt::format("xe_out_interpolator_{}", interpolator_index).c_str());
+          fmt::format("xe_interpolator_{}", interpolator_index).c_str());
       input_output_interpolators_[interpolator_index] = interpolator;
       builder_->addDecoration(interpolator, spv::DecorationLocation, int(output_location));
       builder_->addDecoration(interpolator, spv::DecorationInvariant);
@@ -2862,7 +2948,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
         spv::Id interpolator = builder_->createVariable(
             spv::NoPrecision, spv::StorageClassInput, type_float4_,
-            fmt::format("xe_in_interpolator_{}", interpolator_index).c_str());
+            fmt::format("xe_interpolator_{}", interpolator_index).c_str());
         input_output_interpolators_[interpolator_index] = interpolator;
         builder_->addDecoration(interpolator, spv::DecorationLocation, int(input_location));
         if (shader_modification.pixel.interpolators_centroid &
@@ -4003,10 +4089,12 @@ spv::Id SpirvShaderTranslator::EndianSwap32Uint(spv::Id value, spv::Id endian) {
   SpirvBuilder::IfBuilder if_16in32(is_8in32_or_16in32, spv::SelectionControlMaskNone, *builder_);
   spv::Id swapped_16in32;
   {
-    swapped_16in32 = builder_->createQuadOp(
-        spv::OpBitFieldInsert, type,
-        builder_->createBinOp(spv::OpShiftRightLogical, type, value, const_uint_16_typed), value,
-        builder_->makeIntConstant(16), builder_->makeIntConstant(16));
+    // (value >> 16) | (value << 16) - avoids OpBitFieldInsert, which requires
+    // GLSL ES 3.10 when cross-compiled for GLES.
+    swapped_16in32 = builder_->createBinOp(
+        spv::OpBitwiseOr, type,
+        builder_->createBinOp(spv::OpShiftRightLogical, type, value, const_uint_16_typed),
+        builder_->createBinOp(spv::OpShiftLeftLogical, type, value, const_uint_16_typed));
   }
   if_16in32.makeEndIf();
   value = if_16in32.createMergePhi(swapped_16in32, value);
@@ -4052,6 +4140,10 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
 }
 
 spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords_int) {
+  if (features_.shared_memory_via_textures) {
+    return LoadUint32FromVertexFetchMemory(address_dwords_int, UINT32_MAX);
+  }
+
   spv::StorageClass storage_class = features_.spirv_version >= spv::Spv_1_3
                                         ? spv::StorageClassStorageBuffer
                                         : spv::StorageClassUniform;
@@ -4113,6 +4205,155 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords
   spv::Id value_phi_result = value_phi_op->getResultId();
   builder_->getBuildPoint()->addInstruction(std::move(value_phi_op));
   return value_phi_result;
+}
+
+spv::Id SpirvShaderTranslator::GetOrCreateVertexMemorySampler(uint32_t fetch_constant,
+                                                              bool is_index) {
+  for (const VertexMemorySampler& sampler : vertex_memory_samplers_) {
+    if (sampler.fetch_constant == fetch_constant && sampler.is_index == is_index) {
+      return sampler.variable;
+    }
+  }
+
+  // The vertex stage reads guest memory from a plain uniform array where the
+  // driver can't feed textures to it (see Features::vertex_memory_uniforms);
+  // the fragment stage uses texture fetches.
+  const bool uniform_array = features_.vertex_memory_uniforms && is_vertex_shader();
+  std::string name;
+  if (uniform_array) {
+    spv::Id variable = spv::NoResult;
+    if (is_index) {
+      variable = uniform_index_memory_;
+      name = "xe_index_data";
+    } else if (uniform_vertex_memory_count_ < kMaxVertexMemoryUniformArrays) {
+      variable = uniform_vertex_memory_[uniform_vertex_memory_count_];
+      name = fmt::format("xe_vfetch_data_{}", uniform_vertex_memory_count_);
+      ++uniform_vertex_memory_count_;
+    }
+    if (variable == spv::NoResult) {
+      // Out of arrays - reads become zero rather than failing the shader.
+      variable = uniform_vertex_memory_[0];
+      name = "xe_vfetch_data_0";
+      REXGPU_ERROR("GLES: too many vertex fetch constants in one vertex shader");
+    }
+    VertexMemorySampler& sampler = vertex_memory_samplers_.emplace_back();
+    sampler.fetch_constant = fetch_constant;
+    sampler.name = std::move(name);
+    sampler.variable = variable;
+    sampler.is_index = is_index;
+    sampler.uniform_count = Features::kVertexMemoryUniformCount;
+    return variable;
+  }
+
+  // A combined image sampler (OpTypeSampledImage) of one dword per texel, 2D.
+  const bool float_texels = features_.vertex_memory_float_textures;
+  spv::Id image_type =
+      builder_->makeImageType(float_texels ? type_float_ : type_uint_, spv::Dim2D, false, false,
+                              false, 1, spv::ImageFormatUnknown);
+  spv::Id sampled_image_type = builder_->makeSampledImageType(image_type);
+  name = is_index ? std::string("xe_index_mem")
+                  : fmt::format("xe_vfetch_mem_{}", vertex_memory_samplers_.size());
+  spv::Id variable = builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
+                                              sampled_image_type, name.c_str());
+  builder_->addDecoration(variable, spv::DecorationDescriptorSet,
+                          int(kDescriptorSetTexturesVertex));
+  builder_->addDecoration(variable, spv::DecorationBinding,
+                          int(64 + vertex_memory_samplers_.size()));
+  if (features_.spirv_version >= spv::Spv_1_4) {
+    main_interface_.push_back(variable);
+  }
+
+  VertexMemorySampler& sampler = vertex_memory_samplers_.emplace_back();
+  sampler.fetch_constant = fetch_constant;
+  sampler.name = std::move(name);
+  sampler.variable = variable;
+  sampler.is_index = is_index;
+  sampler.uniform_count = 0;
+  return variable;
+}
+
+spv::Id SpirvShaderTranslator::LoadUint32FromVertexFetchMemory(spv::Id address_dwords_int,
+                                                              uint32_t fetch_constant) {
+  const bool is_index = fetch_constant == UINT32_MAX;
+  spv::Id sampler = GetOrCreateVertexMemorySampler(fetch_constant, is_index);
+
+  // Address relative to the base of the buffer bound to the sampler. The guest
+  // addresses are absolute dwords in the 512 MB physical space, while the
+  // texture holds only the small buffer the shader can access.
+  spv::Id base_dwords;
+  if (is_index) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
+    base_dwords = builder_->createBinOp(
+        spv::OpShiftRightLogical, type_uint_,
+        builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                         uniform_system_constants_, id_vector_temp_),
+                             spv::NoPrecision),
+        builder_->makeUintConstant(2));
+    base_dwords = builder_->createUnaryOp(spv::OpBitcast, type_int_, base_dwords);
+  } else {
+    const uint32_t fetch_constant_word_0_index = fetch_constant << 1;
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(int(fetch_constant_word_0_index >> 2)));
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(int(fetch_constant_word_0_index & 3)));
+    spv::Id fetch_constant_word_0 = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    base_dwords = builder_->createUnaryOp(
+        spv::OpBitcast, type_int_,
+        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, fetch_constant_word_0,
+                              builder_->makeUintConstant(2)));
+  }
+
+  spv::Id relative = builder_->createBinOp(spv::OpISub, type_int_, address_dwords_int, base_dwords);
+  relative = builder_->createBinBuiltinCall(type_int_, ext_inst_glsl_std_450_, GLSLstd450SMax,
+                                            relative, const_int_0_);
+  if (features_.vertex_memory_uniforms && is_vertex_shader()) {
+    // Plain uniform array indexed by the dword offset into the buffer. Bounded
+    // so an out-of-window access reads the last uploaded dword instead of
+    // indexing outside the array.
+    relative = builder_->createBinBuiltinCall(
+        type_int_, ext_inst_glsl_std_450_, GLSLstd450SMin, relative,
+        builder_->makeIntConstant(int(Features::kVertexMemoryUniformCount - 1)));
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(relative);
+    return builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, sampler, id_vector_temp_),
+        spv::NoPrecision);
+  }
+  // Fixed 2048-texel row width (all ES 3.0 devices support at least 2048x2048).
+  constexpr uint32_t kTextureWidth = 2048;
+  constexpr uint32_t kTextureWidthLog2 = 11;
+  spv::Id texel_x = builder_->createBinOp(spv::OpBitwiseAnd, type_int_, relative,
+                                          builder_->makeIntConstant(kTextureWidth - 1));
+  spv::Id texel_y = builder_->createBinOp(spv::OpShiftRightLogical, type_int_, relative,
+                                          builder_->makeIntConstant(kTextureWidthLog2));
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(texel_x);
+  id_vector_temp_.push_back(texel_y);
+  spv::Id coordinates = builder_->createCompositeConstruct(type_int2_, id_vector_temp_);
+
+  spv::Id loaded_sampler = builder_->createLoad(sampler, spv::NoPrecision);
+  const bool float_texels = features_.vertex_memory_float_textures;
+  std::unique_ptr<spv::Instruction> image_fetch_op = std::make_unique<spv::Instruction>(
+      builder_->getUniqueId(), float_texels ? type_float4_ : type_uint4_, spv::OpImageFetch);
+  image_fetch_op->addIdOperand(loaded_sampler);
+  image_fetch_op->addIdOperand(coordinates);
+  image_fetch_op->addImmediateOperand(
+      static_cast<uint32_t>(spv::ImageOperandsLodMask));
+  image_fetch_op->addIdOperand(const_int_0_);
+  spv::Id texel = image_fetch_op->getResultId();
+  builder_->getBuildPoint()->addInstruction(std::move(image_fetch_op));
+  if (float_texels) {
+    // Recover the original dword bit pattern from the R32F texel.
+    return builder_->createUnaryOp(
+        spv::OpBitcast, type_uint_, builder_->createCompositeExtract(texel, type_float_, 0));
+  }
+  return builder_->createCompositeExtract(texel, type_uint_, 0);
 }
 
 void SpirvShaderTranslator::StoreUint32ToSharedMemory(spv::Id value, spv::Id address_dwords_int,

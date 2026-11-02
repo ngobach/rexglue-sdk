@@ -101,6 +101,11 @@ struct BuilderContext {
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 
+  /// True when the emitter will produce a `loc_<addr>:` label for this address
+  /// inside the function currently being emitted (i.e. some non-link branch in
+  /// this function's own blocks targets it).
+  bool emitsLabel(uint32_t addr) const;
+
   /// Get the function graph (single source of truth for function info)
   const FunctionGraph& graph() const;
 

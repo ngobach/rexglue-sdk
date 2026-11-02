@@ -399,6 +399,33 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // For hosts without shader storage buffers (OpenGL ES 3.0): vertex fetch and
+    // index data are read from small integer textures uploaded per draw instead
+    // of the 512 MB shared memory buffer.
+    bool shared_memory_via_textures = false;
+
+    // Store the same memory textures as R32F instead of R32UI and recover the
+    // dword with floatBitsToUint. ANGLE's Metal backend fails to feed integer
+    // samplers to the vertex stage (every texelFetch returns 0), while float
+    // samplers work in both stages.
+    bool vertex_memory_float_textures = false;
+
+    // Read vertex-stage memory (vertex fetch and index data) from a plain
+    // uniform array instead of a texture. ANGLE's Metal backend returns 0 for
+    // every vertex-stage texture read (both texelFetch and textureLod), so on
+    // ES 3.0 without storage buffers the vertex stage uses
+    // `uniform uint xe_vfetch_data_N[kVertexMemoryUniformCount]` filled per
+    // draw. The fragment stage keeps using textures.
+    bool vertex_memory_uniforms = false;
+    // Dwords per vertex memory uniform array. Three arrays plus the other
+    // uniforms stay inside GL_MAX_VERTEX_UNIFORM_VECTORS (1024 vectors on ANGLE
+    // Metal).
+    static constexpr uint32_t kVertexMemoryUniformCount = 512;
+
+    // Whether dFdxCoarse/dFdyCoarse (GL_ARB_derivative_control, GLSL ES 3.20)
+    // are available; otherwise plain dFdx/dFdy are used.
+    bool derivative_control = true;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -659,6 +686,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id EndianSwap128Uint4(spv::Id value, spv::Id endian);
 
   spv::Id LoadUint32FromSharedMemory(spv::Id address_dwords_int);
+  // ES 3.0 fallback: reads a dword from the per-fetch-constant vertex buffer
+  // texture relative to the fetch constant's base address.
+  spv::Id LoadUint32FromVertexFetchMemory(spv::Id address_dwords_int,
+                                          uint32_t fetch_constant);
+  spv::Id GetOrCreateVertexMemorySampler(uint32_t fetch_constant, bool is_index);
   // If `replace_mask` is provided, the bits specified in the mask will be
   // replaced with those from the value via OpAtomicAnd/Or.
   // Bits of `value` not in `replace_mask` will be ignored.
@@ -894,6 +926,24 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // are, for regular fetches, two bindings (unsigned and signed).
   std::vector<TextureBinding> texture_bindings_;
   std::vector<SamplerBinding> sampler_bindings_;
+
+  // ES 3.0 vertex memory textures (index and per-fetch-constant vertex
+  // buffers), created lazily while translating the vertex shader.
+  struct VertexMemorySampler {
+    uint32_t fetch_constant;  // UINT32_MAX for the index buffer.
+    std::string name;
+    spv::Id variable;
+    bool is_index;
+    // For the uniform-array fallback: the number of dwords uploadable per draw.
+    uint32_t uniform_count = 0;
+  };
+  std::vector<VertexMemorySampler> vertex_memory_samplers_;
+  // Plain uniform arrays for vertex-stage guest memory (ES 3.0 fallback),
+  // created at module scope in StartTranslation.
+  static constexpr uint32_t kMaxVertexMemoryUniformArrays = 2;
+  spv::Id uniform_vertex_memory_[kMaxVertexMemoryUniformArrays] = {spv::NoResult, spv::NoResult};
+  uint32_t uniform_vertex_memory_count_ = 0;
+  spv::Id uniform_index_memory_ = spv::NoResult;
 
   // VS as VS only - int, or VS as compute (kMemExportCompute) only - uint3.
   spv::Id input_vertex_index_;
