@@ -47,8 +47,9 @@ endif()
 # SDL can create an ES context.
 option(REXGLUE_USE_GLES "Enable OpenGL ES graphics backend" ON)
 
-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
-    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
+if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN AND NOT REXGLUE_USE_GLES)
+    message(FATAL_ERROR
+        "At least one graphics backend must be enabled (D3D12, Vulkan or GLES)")
 endif()
 
 if (REXGLUE_ENABLE_FIDELITYFX AND
@@ -73,7 +74,11 @@ if(UNIX AND NOT APPLE)
         "$ORIGIN"
         "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
     )
-    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+    # Keep the install RPATH free of the build machine's toolchain paths when
+    # producing a device bundle with a cross toolchain and sysroot.
+    if(NOT CMAKE_CROSSCOMPILING)
+        set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+    endif()
 elseif(APPLE)
     # Use loader-relative install names on macOS so installed binaries remain
     # self-contained within the install prefix.

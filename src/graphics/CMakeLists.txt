@@ -98,8 +98,13 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_GLES)
+    # The shader translator builds SPIR-V for both backends.
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES})
+endif()
+
 if(REXGLUE_USE_VULKAN)
-    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_VULKAN_SOURCES})
 endif()
 
 if(REXGLUE_USE_GLES)
@@ -129,6 +134,10 @@ target_include_directories(rexgpu-xenos PRIVATE
 
 target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
 
+if(REXGLUE_USE_VULKAN)
+    target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_VULKAN=1)
+endif()
+
 rex_target_pch(rexgpu-xenos
     <mutex>
     <unordered_map>
@@ -155,10 +164,16 @@ target_link_libraries(rexgpu-xenos PRIVATE
     xxHash::xxhash
 )
 
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_GLES)
+    target_link_libraries(rexgpu-xenos PRIVATE
+        spirv-tools-headers
+        glslang::SPIRV
+    )
+endif()
+
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexgpu-xenos PRIVATE
         Vulkan::Headers
-        glslang::SPIRV
         GPUOpen::VulkanMemoryAllocator
         glslang
         MachineIndependent

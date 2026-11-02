@@ -160,12 +160,35 @@ bool Memory::Initialize() {
 #else
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
+#if defined(__linux__)
+  // Do not start at 1 << 32 on Linux: the Mali blobs used by the R36S map GPU
+  // memory at fixed CPU addresses in the low 4 GiB range, so a 4.5 GB guest
+  // arena at 0x100000000 makes every GPU allocation fail (the kernel logs
+  // "mali ff400000.gpu: mmap failed -22", glLinkProgram returns
+  // GL_OUT_OF_MEMORY and glTexImage* fail). 1 << 38 (256 GiB) is below the
+  // 39-bit user address space limit of that kernel and well clear of the GPU
+  // mappings.
+  size_t first_candidate = 38;
+#else
+  size_t first_candidate = 32;
+#endif
   mapping_base_ = 0;
-  for (size_t n = 32; n < 64; n++) {
+  for (size_t n = first_candidate; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
     if (!MapViews(mapping_base)) {
       mapping_base_ = mapping_base;
       break;
+    }
+  }
+  if (!mapping_base_ && first_candidate != 32) {
+    // Fall back to the low range if the high candidates are unavailable
+    // (for example in a restricted virtual address space).
+    for (size_t n = 32; n < first_candidate; n++) {
+      auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
+      if (!MapViews(mapping_base)) {
+        mapping_base_ = mapping_base;
+        break;
+      }
     }
   }
   if (!mapping_base_) {

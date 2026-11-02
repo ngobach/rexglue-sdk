@@ -35,6 +35,17 @@ endif()
 set(REXGLUE_RECOMP_DEBUG_INFO "line-tables-only" CACHE STRING
     "Debug info level for generated code: line-tables-only, full, or none")
 
+# rexglue executable used to run codegen. Native builds use the tool target; a
+# cross build must point this at a rexglue built for the build machine, since
+# the target-arch executable cannot run here.
+set(REXGLUE_EXECUTABLE "" CACHE FILEPATH
+    "rexglue executable for codegen (default: the rexglue tool target)")
+if(REXGLUE_EXECUTABLE)
+    set(REXGLUE_CODEGEN_TOOL "${REXGLUE_EXECUTABLE}")
+else()
+    set(REXGLUE_CODEGEN_TOOL $<TARGET_FILE:rex::rexglue>)
+endif()
+
 # Guest SEH scopes emit __try/__except, which traps hardware faults only under
 # asynchronous EH. clang++ spells that flag the GNU way.
 set(REXGLUE_RECOMP_OPTIONS "")
@@ -117,7 +128,7 @@ endmacro()
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
-    COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+    COMMAND ${REXGLUE_CODEGEN_TOOL} codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
     COMMENT "Generating recompiled code for {{ names.snake_case }}"

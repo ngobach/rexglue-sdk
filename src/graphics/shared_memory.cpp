@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -157,6 +158,13 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
                                                          void* callback_context,
                                                          void* callback_data,
                                                          uint64_t callback_argument) {
+  // Diagnostic / performance knob for the R36S: every guest write to a watched
+  // page takes a SIGBUS and an mprotect round trip, which throttles the whole
+  // process. With this set, textures are only invalidated by guest fetch
+  // constant writes instead of by memory writes.
+  if (getenv("GLES_NO_WRITE_WATCH")) {
+    return nullptr;
+  }
   if (length == 0 || start >= kBufferSize) {
     return nullptr;
   }

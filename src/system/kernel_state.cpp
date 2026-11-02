@@ -651,12 +651,15 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
       auto global_lock = global_critical_region_.AcquireDeferred();
       while (dispatch_thread_running_) {
         global_lock.lock();
-        if (dispatch_queue_.empty()) {
-          dispatch_cond_.wait(global_lock);
-          if (!dispatch_thread_running_) {
-            global_lock.unlock();
-            break;
-          }
+        // Predicate wait: the destructor sets the flag and notifies without
+        // taking the lock, so a plain wait() can miss the notification and
+        // leave the thread sleeping forever while ~KernelState joins it.
+        dispatch_cond_.wait(global_lock, [this] {
+          return !dispatch_thread_running_ || !dispatch_queue_.empty();
+        });
+        if (!dispatch_thread_running_) {
+          global_lock.unlock();
+          break;
         }
         auto fn = std::move(dispatch_queue_.front());
         dispatch_queue_.pop_front();

@@ -278,9 +278,46 @@ void GetTextureTotalSize(xenos::DataDimension dimension, uint32_t base_pitch_tex
 // bytes_per_block_log2 is log2_floor according to how Direct3D 9 calculates it,
 // but k_32_32_32 textures are never tiled anyway likely.
 
-int32_t GetTiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_block_log2);
-int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, uint32_t height,
-                         uint32_t bytes_per_block_log2);
+// Inline because the texture loaders call these per pixel; an out-of-line call
+// dominates CPU decoding on the R36S (1280x720 tiled textures reloaded every
+// frame).
+inline int32_t GetTiledOffset2D(int32_t x, int32_t y, uint32_t pitch,
+                                uint32_t bytes_per_block_log2) {
+  // https://github.com/gildor2/UModel/blob/de8fbd3bc922427ea056b7340202dcdcc19ccff5/Unreal/UnTexture.cpp#L489
+  pitch = rex::align(pitch, xenos::kTextureTileWidthHeight);
+  // Top bits of coordinates.
+  int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (bytes_per_block_log2 + 7);
+  // Lower bits of coordinates (result is 6-bit value).
+  int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bytes_per_block_log2;
+  // Mix micro/macro + add few remaining x/y bits.
+  int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  // Mix bits again.
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+inline int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, uint32_t height,
+                                uint32_t bytes_per_block_log2) {
+  // Reconstructed from disassembly of XGRAPHICS::TileVolume.
+  pitch = rex::align(pitch, xenos::kTextureTileWidthHeight);
+  height = rex::align(height, xenos::kTextureTileWidthHeight);
+  int32_t macro_outer = ((y >> 4) + (z >> 2) * int32_t(height >> 4)) * int32_t(pitch >> 5);
+  int32_t macro = ((((x >> 5) + macro_outer) << (bytes_per_block_log2 + 6)) & 0xFFFFFFF) << 1;
+  int32_t micro = (((x & 7) + ((y & 6) << 2)) << (bytes_per_block_log2 + 6)) >> 6;
+  int32_t offset_outer = ((y >> 3) + (z >> 2)) & 1;
+  int32_t offset1 = offset_outer + ((((x >> 3) + (offset_outer << 1)) & 3) << 1);
+  int32_t offset2 = ((macro + (micro & ~15)) << 1) + (micro & 15) +
+                    ((z & 3) << (bytes_per_block_log2 + 6)) + ((y & 1) << 4);
+  int32_t address = (offset1 & 1) << 3;
+  address += (offset2 >> 6) & 7;
+  address <<= 3;
+  address += offset1 & ~1;
+  address <<= 2;
+  address += offset2 & ~511;
+  address <<= 3;
+  address += offset2 & 63;
+  return address;
+}
 // Because (0, 0, 0) within each 32x32x4-block tile is stored in memory first,
 // and the tiled address grows monotonically with Z/4, then Y/32, then X/32
 // blocks.

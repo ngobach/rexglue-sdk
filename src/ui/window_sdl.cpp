@@ -36,8 +36,10 @@
 
 #include <rex/ui/surface_mac.h>
 #else
+#if defined(REX_HAS_X11_WAYLAND_SURFACES)
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
+#endif
 #endif
 
 #include <rex/ui/surface_sdl.h>
@@ -214,7 +216,13 @@ bool WindowSDL::OpenImpl() {
   if (destruction_receiver.IsWindowDestroyed()) {
     return true;
   }
-  if (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_INPUT_FOCUS) {
+  // KMSDRM has no window manager and therefore never reports
+  // SDL_WINDOW_INPUT_FOCUS; the window owns the display, so it is focused.
+  // Without this the mnk keyboard driver ignores every key on the device.
+  const char* video_driver = SDL_GetCurrentVideoDriver();
+  const bool always_focused =
+      video_driver != nullptr && SDL_strcmp(video_driver, "kmsdrm") == 0;
+  if (always_focused || (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_INPUT_FOCUS)) {
     OnFocusUpdate(true, destruction_receiver);
   }
   return true;
@@ -420,6 +428,7 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #else
+#if defined(REX_HAS_X11_WAYLAND_SURFACES)
   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
     auto* wl_display_ptr = static_cast<struct wl_display*>(
@@ -439,7 +448,8 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       return std::make_unique<XcbWindowSurface>(XGetXCBConnection(display), x11_window);
     }
   }
-#endif
+#endif  // REX_HAS_X11_WAYLAND_SURFACES
+#endif  // platform
   // Backends that manage their own host context (GLES) need only the SDL
   // window; this also covers KMSDRM, which has no platform-native surface.
   if (allowed_types & Surface::kTypeFlag_SDLWindow) {

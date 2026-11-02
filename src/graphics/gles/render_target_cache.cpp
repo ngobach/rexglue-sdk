@@ -174,6 +174,16 @@ RenderTargetCache::RenderTarget* GlesRenderTargetCache::CreateRenderTarget(Rende
   }
   GetFunctions().TexImage2D(GL_TEXTURE_2D, 0, GLint(internal_format), GLsizei(width), GLsizei(height), 0,
                    format, type, nullptr);
+  {
+    const GLenum texture_error = GetFunctions().GetError();
+    if (texture_error != GL_NO_ERROR) {
+      REXGPU_ERROR(
+          "GLES render target cache: texture allocation failed (0x{:X}) for {}x{} {} "
+          "(internal 0x{:X}, format 0x{:X}, type 0x{:X})",
+          uint32_t(texture_error), width, height, key.GetDebugName(), uint32_t(internal_format),
+          uint32_t(format), uint32_t(type));
+    }
+  }
   GetFunctions().TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   GetFunctions().TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   GetFunctions().TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);

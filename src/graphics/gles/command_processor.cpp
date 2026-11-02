@@ -20,6 +20,7 @@
 
 #include <rex/graphics/flags.h>
 #include <rex/graphics/gles/constants.h>
+#include <rex/graphics/gles/frame_stats.h>
 #include <rex/graphics/gles/pipeline_cache.h>
 #include <rex/graphics/gles/primitive_processor.h>
 #include <rex/graphics/gles/render_target_cache.h>
@@ -183,6 +184,20 @@ void BindTextureUnit(uint32_t unit, GLenum target, GLuint texture) {
   GetFunctions().BindTexture(target, texture);
 }
 
+// GLES_LOG_FPS report: time spent submitting draws (including texture decoding
+// and vertex data uploads) versus the whole guest frame.
+double g_draw_seconds_accumulated = 0.0;
+uint64_t g_draw_calls_accumulated = 0;
+
+struct ScopedDrawTimer {
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  ~ScopedDrawTimer() {
+    g_draw_seconds_accumulated += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    ++g_draw_calls_accumulated;
+  }
+};
+
 }  // namespace
 
 GlesCommandProcessor::GlesCommandProcessor(GraphicsSystem* graphics_system,
@@ -327,6 +342,7 @@ Shader* GlesCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t
 bool GlesCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                      IndexBufferInfo* index_buffer_info,
                                      bool major_mode_explicit) {
+  ScopedDrawTimer draw_timer;
   const bool log_draws = getenv("GLES_LOG_DRAWS") != nullptr;
   static uint32_t draws_logged = 0;
   const bool log_this_draw = log_draws && draws_logged < 60;
@@ -949,6 +965,35 @@ bool GlesCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t in
     }
   }
   // Bind the shared memory storage buffers and the index buffer, then draw.
+  //
+  // On ES 3.1+ the vertex shader reads vertex data straight from those storage
+  // buffers, so the pages it uses must be uploaded from guest memory first.
+  // (ES 3.0 has no storage buffers; there each draw uploads its vertex and
+  // index data as textures/uniform arrays instead, which needs nothing here.)
+  if (!pipeline_cache_->uses_texture_memory()) {
+    const Shader::ConstantRegisterMap& constant_map_vertex =
+        vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+      uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+      uint32_t j;
+      while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+        vfetch_bits_remaining &= ~(uint32_t(1) << j);
+        const uint32_t vfetch_index = i * 32 + j;
+        const xenos::xe_gpu_vertex_fetch_t vfetch_constant =
+            register_file_->GetVertexFetch(vfetch_index);
+        if (vfetch_constant.type != xenos::FetchConstantType::kVertex ||
+            !vfetch_constant.size) {
+          continue;
+        }
+        if (!shared_memory_->RequestRange(vfetch_constant.address << 2,
+                                          vfetch_constant.size << 2)) {
+          REXGPU_ERROR("GLES: failed to request vertex buffer at 0x{:08X} (size {})",
+                       vfetch_constant.address << 2, vfetch_constant.size << 2);
+          return false;
+        }
+      }
+    }
+  }
   shared_memory_->Bind();
   if (getenv("GLES_LOG_BINDINGS")) {
     static std::set<GLuint> logged_draw_bindings;
@@ -2134,14 +2179,35 @@ void GlesCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuf
   frame_draw_index_ = 0;
   if (getenv("GLES_LOG_FPS")) {
     static uint32_t swaps = 0;
+    static uint32_t logged_swaps = 0;
     static auto swap_start = std::chrono::steady_clock::now();
     ++swaps;
-    if (swaps % 30 == 1) {
+    if (swaps - logged_swaps >= 30) {
       const double seconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - swap_start).count();
-      REXGPU_INFO("GLES swap {} ({:.1f} fps) frontbuffer={}x{}", swaps,
-                  seconds > 0.0 ? double(swaps) / seconds : 0.0, frontbuffer_width,
-                  frontbuffer_height);
+      const uint32_t frames = swaps - logged_swaps;
+      const double fps = seconds > 0.0 ? double(frames) / seconds : 0.0;
+      const double draw_ms = g_draw_seconds_accumulated * 1000.0 / double(frames);
+      const double draws_per_frame = double(g_draw_calls_accumulated) / double(frames);
+      const double frame_ms = seconds * 1000.0 / double(frames);
+      REXGPU_INFO(
+          "GLES swap {} ({:.1f} fps) frontbuffer={}x{} frame {:.1f} ms, draw {:.1f} ms "
+          "({:.1f} calls), textures {:.1f} ms (decode {:.1f}, upload {:.1f}; {} loads, {} KB), "
+          "other {:.1f} ms",
+          swaps, fps, frontbuffer_width, frontbuffer_height, frame_ms, draw_ms,
+          draws_per_frame, g_texture_load_seconds * 1000.0 / double(frames),
+          g_texture_decode_seconds * 1000.0 / double(frames),
+          g_texture_upload_seconds * 1000.0 / double(frames), g_texture_load_count,
+          g_texture_load_bytes >> 10, std::max(0.0, frame_ms - draw_ms));
+      g_draw_seconds_accumulated = 0.0;
+      g_draw_calls_accumulated = 0;
+      g_texture_load_seconds = 0.0;
+      g_texture_decode_seconds = 0.0;
+      g_texture_upload_seconds = 0.0;
+      g_texture_load_count = 0;
+      g_texture_load_bytes = 0;
+      logged_swaps = swaps;
+      swap_start = std::chrono::steady_clock::now();
     }
   }
   if (getenv("GLES_DEBUG_SWAP_READ") && render_target_cache_) {

@@ -10,10 +10,12 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include <rex/assert.h>
 #include <rex/graphics/gles/constants.h>
+#include <rex/graphics/gles/frame_stats.h>
 #include <rex/graphics/gles/texture_cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -21,6 +23,12 @@
 #include <rex/math.h>
 
 namespace rex::graphics::gles {
+
+double g_texture_load_seconds = 0.0;
+double g_texture_decode_seconds = 0.0;
+double g_texture_upload_seconds = 0.0;
+uint64_t g_texture_load_count = 0;
+uint64_t g_texture_load_bytes = 0;
 
 namespace {
 
@@ -364,6 +372,31 @@ std::unique_ptr<TextureCache::Texture> GlesTextureCache::CreateTexture(TextureKe
       target = GL_TEXTURE_2D_ARRAY;
       break;
   }
+  // The Xbox reads only the layer a shader samples directly from guest memory;
+  // the declared stack depth does not reserve that much guest RAM. Uploading
+  // every declared layer eagerly can therefore allocate far more than the
+  // device has (Feeding Frenzy declares a 1280x720 stack of 127 layers = 468 MB
+  // even though the guest image cannot contain that). Keep small stacks intact
+  // and clamp only stacks that exceed the configured per-texture budget.
+  if (const char* limit_env = getenv("GLES_MAX_STACKED_TEXTURE_MB")) {
+    const uint32_t limit_mb = uint32_t(atoi(limit_env));
+    // Cube maps have a fixed six faces; clamping them would break sampling.
+    const bool clammable_dimension = key.dimension == xenos::DataDimension::k2DOrStacked ||
+                                     key.dimension == xenos::DataDimension::k3D;
+    if (limit_mb && clammable_dimension && key.GetDepthOrArraySize() > 1) {
+      const uint64_t layer_bytes = uint64_t(key.GetWidth()) * key.GetHeight() * 4;
+      const uint64_t max_layers =
+          std::max<uint64_t>(1, (uint64_t(limit_mb) << 20) / std::max<uint64_t>(layer_bytes, 1));
+      if (uint64_t(key.GetDepthOrArraySize()) > max_layers) {
+        REXGPU_WARN(
+            "GLES texture cache: clamping stacked {}x{} texture from {} to {} layers "
+            "({} MB budget)",
+            key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(max_layers),
+            limit_mb);
+        key.depth_or_array_size_minus_1 = uint32_t(max_layers) - 1;
+      }
+    }
+  }
   return std::make_unique<GlesTexture>(*this, key, target);
 }
 
@@ -410,9 +443,23 @@ bool GlesTextureCache::DecodeLevel(GlesTexture& texture, const HostFormat& host_
 
   const bool is_3d = key.dimension == xenos::DataDimension::k3D;
   const bool is_cube = key.dimension == xenos::DataDimension::kCube;
+  // The game loads almost exclusively k_8_8_8_8 textures (including the
+  // 1280x720 background reloaded every frame); keep the per-pixel switch out of
+  // their inner loop.
+  const bool is_rgba8 =
+      key.format == xenos::TextureFormat::k_8_8_8_8 ||
+      key.format == xenos::TextureFormat::k_8_8_8_8_A ||
+      key.format == xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16 ||
+      key.format == xenos::TextureFormat::k_8_8_8_8_GAMMA_EDRAM;
   const uint32_t array_size = is_cube ? 6 : (is_3d ? 1 : depth_or_array_size);
   const uint32_t depth = is_3d ? depth_or_array_size : 1;
   const uint32_t layer_count = is_cube ? 6 : array_size;
+  // The caller passes an uninitialised variable here and uses it as the layer
+  // count for 2D/stacked and cube textures and as the volume depth for 3D
+  // textures. Leaving it unwritten made the upload use stack garbage as the
+  // layer count (a 1280x720 single-layer texture became a 127-layer, 468 MB
+  // TexImage3D on the R36S).
+  depth_out = is_3d ? depth : layer_count;
 
   data_out.resize(size_t(width_out) * height_out * depth * layer_count *
                   host_format.bytes_per_pixel);
@@ -423,8 +470,9 @@ bool GlesTextureCache::DecodeLevel(GlesTexture& texture, const HostFormat& host_
   (void)guest_memory_end;
 
   for (uint32_t layer = 0; layer < layer_count; ++layer) {
-    // Cube faces are stored as the first six array slices.
-    uint32_t slice = is_cube ? layer : 0;
+    // Cube faces and stacked 2D layers are stored as consecutive array slices;
+    // 3D slices are addressed through the Z coordinate instead.
+    const uint32_t slice = is_3d ? 0 : layer;
     for (uint32_t z = 0; z < depth; ++z) {
       for (uint32_t y = 0; y < height_out; ++y) {
         uint8_t* dest_row = data_out.data() +
@@ -452,6 +500,16 @@ bool GlesTextureCache::DecodeLevel(GlesTexture& texture, const HostFormat& host_
           }
           const uint8_t* source = guest_memory + guest_offset;
           uint8_t* dest = dest_row + size_t(x) * host_format.bytes_per_pixel;
+          if (is_rgba8) {
+            uint32_t value;
+            std::memcpy(&value, source, 4);
+            value = xenos::GpuSwap(value, key.endianness);
+            dest[0] = uint8_t((value >> 16) & 0xFF);
+            dest[1] = uint8_t((value >> 8) & 0xFF);
+            dest[2] = uint8_t(value & 0xFF);
+            dest[3] = uint8_t((value >> 24) & 0xFF);
+            continue;
+          }
           switch (key.format) {
             case xenos::TextureFormat::k_8:
             case xenos::TextureFormat::k_8_A:
@@ -554,6 +612,16 @@ bool GlesTextureCache::DecodeLevel(GlesTexture& texture, const HostFormat& host_
 
 bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                              bool load_mips) {
+  const std::chrono::steady_clock::time_point load_start =
+      std::chrono::steady_clock::now();
+  struct LoadTimer {
+    std::chrono::steady_clock::time_point start;
+    ~LoadTimer() {
+      g_texture_load_seconds += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - start).count();
+      ++g_texture_load_count;
+    }
+  } load_timer{load_start};
   GlesTexture& gles_texture = static_cast<GlesTexture&>(texture);
   const TextureKey& key = gles_texture.key();
   if (getenv("GLES_LOG_TEXTURES")) {
@@ -602,6 +670,7 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
     }
     std::vector<uint8_t> data;
     uint32_t width, height, depth;
+    const auto decode_start = std::chrono::steady_clock::now();
     if (!DecodeLevel(gles_texture, host_format, level, level_address, packed, data, width, height,
                      depth)) {
       REXGPU_WARN("GLES texture cache: failed to decode level {} of {}x{}x{} {}", level,
@@ -609,6 +678,19 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
                   FormatInfo::Get(key.format)->name);
       return false;
     }
+    const double level_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_start).count();
+    g_texture_decode_seconds += level_seconds;
+    if (level_seconds > 0.020) {
+      REXGPU_INFO("GLES texture cache: decode {}x{}x{} took {:.1f} ms (tiled {})", width, height,
+                  depth, level_seconds * 1000.0, int(key.tiled));
+    }
+    const auto upload_start = std::chrono::steady_clock::now();
+    if (depth > 1) {
+      REXGPU_INFO("GLES texture cache: decoded {}x{}x{} (dim {}, page 0x{:X}, level {})", width,
+                  height, depth, uint32_t(key.dimension), key.base_page, level);
+    }
+    g_texture_load_bytes += data.size();
     if (level == 0 && !is_cube && !is_3d) {
       if (const char* dump_dir = getenv("GLES_DUMP_TEXTURES")) {
         char path[512];
@@ -638,8 +720,19 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
       GetFunctions().TexImage3D(target, GLint(level), GLint(host_format.internal_format), GLsizei(width),
                        GLsizei(height), gl_depth, 0, host_format.format, host_format.type,
                        data.data());
+      const GLenum upload_error = GetFunctions().GetError();
+      if (upload_error != GL_NO_ERROR) {
+        REXGPU_ERROR(
+            "GLES texture cache: upload failed (0x{:X}) for {}x{}x{} {} level {} "
+            "(internal 0x{:X}, format 0x{:X}, type 0x{:X})",
+            uint32_t(upload_error), width, height, depth, FormatInfo::Get(key.format)->name, level,
+            uint32_t(host_format.internal_format), uint32_t(host_format.format),
+            uint32_t(host_format.type));
+      }
     }
     gles_texture.MarkLevelUploaded(level);
+    g_texture_upload_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - upload_start).count();
     uploaded_levels = std::max(uploaded_levels, level + 1);
     host_memory_usage += uint64_t(width) * height * (is_3d ? depth : layer_count) *
                          host_format.bytes_per_pixel;

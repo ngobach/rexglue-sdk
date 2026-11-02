@@ -938,6 +938,18 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
     // No texture data at all.
     return;
   }
+  if (fetch.stacked) {
+    static uint32_t logged_stacked_fetches = 0;
+    if (logged_stacked_fetches < 20) {
+      ++logged_stacked_fetches;
+      REXGPU_INFO(
+          "texture fetch stacked: dim={} {}x{} stack_depth={} (array {}) "
+          "dwords={:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+          uint32_t(fetch.dimension), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+          uint32_t(fetch.size_2d.stack_depth), depth_or_array_size_minus_1 + 1, fetch.dword_0,
+          fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+    }
+  }
   if (fetch.dimension == xenos::DataDimension::k1D) {
     bool is_invalid_1d = false;
     // TODO(Triang3l): Support long 1D textures.

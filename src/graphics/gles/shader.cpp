@@ -191,6 +191,18 @@ bool GlesShader::GlesTranslation::EnsureShaderObject() {
     REXGPU_ERROR("GLES shader: SPIRV-Cross produced no source");
     return false;
   }
+  // Mali's GLES compiler rejects SPIRV-Cross's "layout(...) invariant out"
+  // ordering ("qualifiers specified in incorrect order"). invariant is only a
+  // reproducibility hint for us, so drop the qualifier.
+  for (size_t position = glsl_source_.find("invariant "); position != std::string::npos;
+       position = glsl_source_.find("invariant ", position)) {
+    if (position == 0 || glsl_source_[position - 1] == ' ' ||
+        glsl_source_[position - 1] == '\n' || glsl_source_[position - 1] == '\t') {
+      glsl_source_.erase(position, 10);
+    } else {
+      position += 10;
+    }
+  }
   if (texture_memory &&
       (glsl_source_.find("bitfieldExtract") != std::string::npos ||
        glsl_source_.find("ldexp") != std::string::npos)) {

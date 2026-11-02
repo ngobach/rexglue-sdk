@@ -64,6 +64,24 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 namespace rex::thread {
 
+// Guest threads must not stop through pthread_exit on POSIX: glibc runs the
+// exit as a forced unwind through the system libgcc_s, whose cursor is
+// incompatible with the libc++abi/libunwind pair zig links statically. The
+// personality routine then calls a function pointer from the wrong unwinder
+// and the thread jumps to a garbage address.
+//
+// Throwing to the thread trampoline keeps the whole unwind inside one C++
+// runtime and still runs frame destructors, unlike longjmp.
+class ThreadExitException {
+ public:
+  explicit ThreadExitException(int exit_code) : exit_code_(exit_code) {}
+
+  int exit_code() const { return exit_code_; }
+
+ private:
+  int exit_code_;
+};
+
 #if REX_PLATFORM_ANDROID
 // May be null if no dynamically loaded functions are required.
 static void* android_libc_;
@@ -981,7 +999,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       cond_.notify_all();
     }
     if (is_current_thread) {
-      pthread_exit(reinterpret_cast<void*>(exit_code));
+      throw ThreadExitException(exit_code);
     } else {
 #if REX_PLATFORM_ANDROID
       if (pthread_kill(thread_, GetSystemSignal(SignalType::kThreadTerminate)) != 0) {
@@ -1437,7 +1455,12 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
                                        [thread] { return thread->handle_.suspend_count_ == 0; });
   }
 
-  start_routine();
+  int exit_code = 0;
+  try {
+    start_routine();
+  } catch (const ThreadExitException& e) {
+    exit_code = e.exit_code();
+  }
 
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
@@ -1446,7 +1469,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   {
     std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
-    thread->handle_.exit_code_ = 0;
+    thread->handle_.exit_code_ = exit_code;
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
   }

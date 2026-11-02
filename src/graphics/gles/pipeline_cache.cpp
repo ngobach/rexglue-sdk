@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <set>
 
 #include <rex/assert.h>
 #include <rex/graphics/gles/gl.h>
@@ -29,6 +31,102 @@
 namespace rex::graphics::gles {
 
 namespace spvc = SPIRV_CROSS_NAMESPACE;
+
+namespace {
+
+// Env knobs are documented as 0/1; treat any value other than empty and "0"
+// as enabled. Checking only for presence made GLES_FORCE_TEXTURE_MEMORY=0
+// still select the texture path.
+bool EnvEnabled(const char* name) {
+  const char* value = getenv(name);
+  return value && *value && strcmp(value, "0") != 0;
+}
+
+// The guest permits a vertex shader to export only a subset of the
+// interpolators its fragment shader reads (the values are undefined on the
+// real GPU). Mali's linker rejects such a program outright ("Fragment shader
+// uses a varying xe_interpolator_N that has not been declared in the vertex
+// shader"), while ANGLE and Mesa tolerate it. Collect the interpolator indices
+// referenced by the GLSL and synthesize declarations for the missing ones.
+void CollectInterpolatorIndices(const std::string& source, std::set<uint32_t>& indices) {
+  static constexpr char kToken[] = "xe_interpolator_";
+  const size_t token_length = sizeof(kToken) - 1;
+  for (size_t position = source.find(kToken); position != std::string::npos;
+       position = source.find(kToken, position + token_length)) {
+    size_t digit_end = position + token_length;
+    while (digit_end < source.size() &&
+           std::isdigit(static_cast<unsigned char>(source[digit_end]))) {
+      ++digit_end;
+    }
+    if (digit_end > position + token_length) {
+      const std::string digits = source.substr(position + token_length,
+                                                digit_end - (position + token_length));
+      indices.insert(uint32_t(std::strtoul(digits.c_str(), nullptr, 10)));
+    }
+  }
+}
+
+std::string AddMissingInterpolators(const std::string& source,
+                                    const std::vector<uint32_t>& missing) {
+  std::string declarations;
+  std::string initializers;
+  for (uint32_t index : missing) {
+    declarations += fmt::format("out highp vec4 xe_interpolator_{};\n", index);
+    initializers += fmt::format("    xe_interpolator_{} = vec4(0.0);\n", index);
+  }
+  std::string patched = source;
+  size_t main_position = patched.find("\nvoid main");
+  if (main_position == std::string::npos) {
+    main_position = patched.size();
+  }
+  patched.insert(main_position, "\n" + declarations);
+  main_position = patched.find("void main");
+  if (main_position != std::string::npos) {
+    const size_t brace = patched.find('{', main_position);
+    if (brace != std::string::npos) {
+      patched.insert(brace + 1, "\n" + initializers);
+    }
+  }
+  return patched;
+}
+
+// Links a trivial vertex shader with the given fragment shader (or a trivial
+// one when 0) so a failure can be attributed to the context rather than to the
+// translated shaders.
+void LinkSelfTest(GLuint fragment_shader, const char* label) {
+  static const char kVertexSource[] =
+      "#version 300 es\nvoid main(){gl_Position=vec4(0.0,0.0,0.0,1.0);}\n";
+  static const char kFragmentSource[] =
+      "#version 300 es\nprecision mediump float;\nout vec4 o;\nvoid main(){o=vec4(1.0);}\n";
+  auto& gl = GetFunctions();
+  const char* source = kVertexSource;
+  GLuint vs = gl.CreateShader(GL_VERTEX_SHADER);
+  gl.ShaderSource(vs, 1, &source, nullptr);
+  gl.CompileShader(vs);
+  GLuint fs = fragment_shader;
+  if (!fs) {
+    const char* fragment_source = kFragmentSource;
+    fs = gl.CreateShader(GL_FRAGMENT_SHADER);
+    gl.ShaderSource(fs, 1, &fragment_source, nullptr);
+    gl.CompileShader(fs);
+  }
+  GLuint program = gl.CreateProgram();
+  gl.AttachShader(program, vs);
+  gl.AttachShader(program, fs);
+  gl.LinkProgram(program);
+  GLint ok = 0;
+  gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  const GLenum error = gl.GetError();
+  gl.DeleteProgram(program);
+  gl.DeleteShader(vs);
+  if (!fragment_shader) {
+    gl.DeleteShader(fs);
+  }
+  REXGPU_INFO("GLES link self-test ({}): link={} GL error 0x{:X}, vs={}, fs={}", label, ok,
+              uint32_t(error), vs, fs);
+}
+
+}  // namespace
 
 GlesPipelineCache::GlesPipelineCache(const RegisterFile& register_file,
                                      GlesRenderTargetCache& render_target_cache,
@@ -51,6 +149,16 @@ bool GlesPipelineCache::Initialize() {
   while (GetFunctions().GetError() != GL_NO_ERROR) {
   }
   uses_texture_memory_ = max_storage_block_size <= 0;
+  // The R36S intentionally uses the ES 3.0 vertex-memory path even though its
+  // Mali driver advertises ES 3.2: mirroring the 512 MB guest address space as
+  // storage buffers exhausts the 1 GB device (and the Mali blob refuses the
+  // large allocations), while per-draw vertex/index uploads do not.
+  if (EnvEnabled("GLES_FORCE_TEXTURE_MEMORY")) {
+    uses_texture_memory_ = true;
+  }
+  GLint max_storage_buffer_bindings = 0;
+  GetFunctions().GetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS,
+                             &max_storage_buffer_bindings);
   GLint max_combined_texture_units = 0;
   GetFunctions().GetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_combined_texture_units);
   GLint max_vertex_texture_units = 0;
@@ -66,13 +174,32 @@ bool GlesPipelineCache::Initialize() {
     features_.max_storage_buffer_range = 128 * 1024 * 1024;
     features_.shared_memory_via_textures = true;
     // ANGLE's Metal backend returns 0 for every vertex-stage texture read, so
-    // the vertex stage takes its memory from a plain uniform array instead.
-    features_.vertex_memory_uniforms = true;
+    // by default the vertex stage takes its memory from plain uniform arrays
+    // instead. Mali (R36S) does support vertex texture fetches and has tight
+    // uniform limits (512-uint arrays exhaust them and programs fail to link),
+    // so allow selecting the texture path there with GLES_VERTEX_TEXTURE_FETCH.
+    features_.vertex_memory_uniforms = !EnvEnabled("GLES_VERTEX_TEXTURE_FETCH");
     features_.derivative_control = false;
   } else {
     features_.spirv_version = spv::Spv_1_3;
-    features_.max_storage_buffer_range =
-        std::min(uint32_t(max_storage_block_size), uint32_t(SharedMemory::kBufferSize));
+    // Split the 512 MB guest mirror into as many slices as the driver allows
+    // (bounded to 16). The Mali-G31 blob refuses large single SSBO
+    // allocations, and finer slices keep the lazy mirror allocation in
+    // GlesSharedMemory small.
+    uint32_t bindings_log2 = 0;
+    const uint32_t max_bindings =
+        uint32_t(std::max<GLint>(max_storage_buffer_bindings, 1));
+    while (bindings_log2 < 4 && (uint32_t(1) << (bindings_log2 + 1)) <= max_bindings) {
+      ++bindings_log2;
+    }
+    uint32_t slice_size = uint32_t(1) << (SharedMemory::kBufferSizeLog2 - bindings_log2);
+    while (bindings_log2 > 0 && slice_size > uint32_t(max_storage_block_size)) {
+      --bindings_log2;
+      slice_size <<= 1;
+    }
+    features_.max_storage_buffer_range = slice_size;
+    REXGPU_INFO("GLES: {} storage buffer bindings, {} MB shared memory slices",
+                max_storage_buffer_bindings, slice_size >> 20);
   }
   features_.full_draw_index_uint32 = true;
   features_.vertex_pipeline_stores_and_atomics = false;
@@ -108,7 +235,11 @@ bool GlesPipelineCache::Initialize() {
     spvc::CompilerGLSL compiler(reinterpret_cast<const uint32_t*>(depth_only_spirv.data()),
                                 depth_only_spirv.size() / sizeof(uint32_t));
     spvc::CompilerGLSL::Options options;
-    options.version = 300;
+    // The depth-only fragment shader is linked with translated vertex shaders,
+    // so it must use the same GLSL ES version they do. Mixing 3.00 and 3.10 in
+    // one program fails to link ("all shaders must use same shading language
+    // version").
+    options.version = uses_texture_memory_ ? 300 : 310;
     options.es = true;
     options.emit_push_constant_as_uniform_buffer = false;
     options.enable_420pack_extension = false;
@@ -121,22 +252,37 @@ bool GlesPipelineCache::Initialize() {
     return false;
   }
   if (getenv("GLES_DEBUG_VS")) {
-    const char* debug_fs_source =
-        getenv("GLES_DEBUG_INTERPS")
-            ? "#version 300 es\nprecision highp float;\nin highp vec4 xe_interpolator_0;\n"
-              "in highp vec4 xe_interpolator_1;\nout vec4 o;\n"
-              "void main() { o = vec4(xe_interpolator_0.xy, xe_interpolator_1.x, 1.0); }\n"
-            : getenv("GLES_DEBUG_TEXPS")
-            ? "#version 300 es\nprecision highp float;\nprecision highp sampler2DArray;\n"
-              "uniform sampler2DArray xe_debug_tex;\nout vec4 o;\n"
-              "void main() { o = texture(xe_debug_tex, vec3(0.5, 0.5, 0.0)); }\n"
-            : "#version 300 es\nprecision mediump float;\nout vec4 o;\n"
-              "void main() { o = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+    const std::string version_directive =
+        uses_texture_memory_ ? "#version 300 es\n" : "#version 310 es\n";
+    std::string debug_fs_source = version_directive;
+    if (getenv("GLES_DEBUG_INTERPS")) {
+      debug_fs_source +=
+          "precision highp float;\nin highp vec4 xe_interpolator_0;\n"
+          "in highp vec4 xe_interpolator_1;\nout vec4 o;\n"
+          "void main() { o = vec4(xe_interpolator_0.xy, xe_interpolator_1.x, 1.0); }\n";
+    } else if (getenv("GLES_DEBUG_TEXPS")) {
+      debug_fs_source +=
+          "precision highp float;\nprecision highp sampler2DArray;\n"
+          "uniform sampler2DArray xe_debug_tex;\nout vec4 o;\n"
+          "void main() { o = texture(xe_debug_tex, vec3(0.5, 0.5, 0.0)); }\n";
+    } else {
+      debug_fs_source +=
+          "precision mediump float;\nout vec4 o;\n"
+          "void main() { o = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+    }
     CompileGlslEsShader(GL_FRAGMENT_SHADER, debug_fs_source, debug_color_fragment_shader_);
   }
   if (!CompileGlslEsShader(GL_FRAGMENT_SHADER, depth_only_glsl, depth_only_fragment_shader_)) {
     REXGPU_ERROR("GLES pipeline cache: failed to compile the depth-only fragment shader");
     return false;
+  }
+  if (const char* dump_root = getenv("GLES_DUMP_SHADERS")) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/depth_only_fs.glsl", dump_root);
+    if (FILE* dump_file = fopen(path, "wb")) {
+      fwrite(depth_only_glsl.data(), 1, depth_only_glsl.size(), dump_file);
+      fclose(dump_file);
+    }
   }
 
   REXGPU_INFO("GLES pipeline cache: shared memory max storage block {} MB ({} bindings)",
@@ -144,6 +290,10 @@ bool GlesPipelineCache::Initialize() {
               shared_memory_storage_buffer_count_log2() >= 32
                   ? 0
                   : (1u << shared_memory_storage_buffer_count_log2()));
+  if (EnvEnabled("GLES_LINK_SELFTEST")) {
+    LinkSelfTest(0, "init, trivial pair");
+    LinkSelfTest(depth_only_fragment_shader_, "init, depth-only FS");
+  }
   return true;
 }
 
@@ -306,26 +456,84 @@ const GlesProgram* GlesPipelineCache::CreateProgram(GlesShader::GlesTranslation*
                  vertex_shader->shader_object(), fragment_shader, depth_only);
     return nullptr;
   }
+  if (EnvEnabled("GLES_LINK_SELFTEST")) {
+    LinkSelfTest(0, "draw, trivial pair");
+    LinkSelfTest(fragment_shader, "draw, real FS");
+  }
+
+  // Mali refuses to link a fragment shader that reads an interpolator the
+  // vertex shader does not declare. Patch the vertex shader copy used for this
+  // program so the pair links (see AddMissingInterpolators).
+  GLuint vertex_shader_object = vertex_shader->shader_object();
+  GLuint patched_vertex_shader = 0;
+  if (!depth_only) {
+    std::set<uint32_t> vertex_interpolators;
+    CollectInterpolatorIndices(vertex_shader->glsl_source(), vertex_interpolators);
+    std::set<uint32_t> pixel_interpolators;
+    CollectInterpolatorIndices(pixel_shader->glsl_source(), pixel_interpolators);
+    std::vector<uint32_t> missing_interpolators;
+    for (uint32_t index : pixel_interpolators) {
+      if (!vertex_interpolators.count(index)) {
+        missing_interpolators.push_back(index);
+      }
+    }
+    if (!missing_interpolators.empty()) {
+      std::string patched_source =
+          AddMissingInterpolators(vertex_shader->glsl_source(), missing_interpolators);
+      if (CompileGlslEsShader(GL_VERTEX_SHADER, patched_source, patched_vertex_shader)) {
+        vertex_shader_object = patched_vertex_shader;
+        REXGPU_INFO(
+            "GLES pipeline cache: VS {:016X} does not declare {} interpolator(s) read by PS "
+            "{:016X}; declared and zeroed them for linking",
+            vertex_shader->shader().ucode_data_hash(), uint32_t(missing_interpolators.size()),
+            pixel_shader->shader().ucode_data_hash());
+      }
+    }
+  }
 
   GLuint program_name = GetFunctions().CreateProgram();
   if (!program_name) {
     REXGPU_ERROR("GLES pipeline cache: glCreateProgram failed");
     return nullptr;
   }
-  GetFunctions().AttachShader(program_name, vertex_shader->shader_object());
+  GetFunctions().AttachShader(program_name, vertex_shader_object);
   GetFunctions().AttachShader(program_name, fragment_shader);
   GetFunctions().LinkProgram(program_name);
-  GetFunctions().DetachShader(program_name, vertex_shader->shader_object());
+  GetFunctions().DetachShader(program_name, vertex_shader_object);
   GetFunctions().DetachShader(program_name, fragment_shader);
+  if (patched_vertex_shader) {
+    GetFunctions().DeleteShader(patched_vertex_shader);
+  }
 
   GLint link_status = 0;
   GetFunctions().GetProgramiv(program_name, GL_LINK_STATUS, &link_status);
   if (!link_status) {
+    const GLenum link_error = GetFunctions().GetError();
+    GLint vs_compile_status = 0, fs_compile_status = 0;
+    GetFunctions().GetShaderiv(vertex_shader->shader_object(), GL_COMPILE_STATUS,
+                               &vs_compile_status);
+    GetFunctions().GetShaderiv(fragment_shader, GL_COMPILE_STATUS, &fs_compile_status);
+    GLint active_uniforms = 0, active_attributes = 0;
+    GetFunctions().GetProgramiv(program_name, GL_ACTIVE_UNIFORMS, &active_uniforms);
+    GetFunctions().GetProgramiv(program_name, GL_ACTIVE_ATTRIBUTES, &active_attributes);
+    GLint max_vs_uniform_vectors = 0, max_fs_uniform_vectors = 0;
+    GetFunctions().GetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &max_vs_uniform_vectors);
+    GetFunctions().GetIntegerv(GL_MAX_FRAGMENT_UNIFORM_VECTORS, &max_fs_uniform_vectors);
     GLint log_length = 0;
     GetFunctions().GetProgramiv(program_name, GL_INFO_LOG_LENGTH, &log_length);
     std::string log(size_t(log_length ? log_length : 1), '\0');
     GetFunctions().GetProgramInfoLog(program_name, GLsizei(log.size()), nullptr, log.data());
-    REXGPU_ERROR("GLES pipeline cache: program link failed:\n{}", log);
+    REXGPU_ERROR(
+        "GLES pipeline cache: program link failed (GL error 0x{:X}, uniforms {}, "
+        "attributes {}, max uniform vectors VS/FS {}/{}):\n{}",
+        uint32_t(link_error), active_uniforms, active_attributes, max_vs_uniform_vectors,
+        max_fs_uniform_vectors, log);
+    REXGPU_ERROR(
+        "GLES pipeline cache: link state: program={}, vs={} (compiled {}, {:016X}), fs={} "
+        "(compiled {}, {:016X})",
+        program_name, vertex_shader->shader_object(), vs_compile_status,
+        vertex_shader->shader().ucode_data_hash(), fragment_shader, fs_compile_status,
+        depth_only ? 0 : pixel_shader->shader().ucode_data_hash());
     GetFunctions().DeleteProgram(program_name);
     return nullptr;
   }

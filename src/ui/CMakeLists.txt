@@ -79,9 +79,13 @@ elseif(APPLE)
         surface_mac.cpp
     )
 else()
-    set(REXUI_PLATFORM_SOURCES
-        surface_gnulinux.cpp
-    )
+    # Native X11/Wayland surfaces are only needed for Vulkan; a KMSDRM/GLES
+    # device build has neither and no X11/xcb headers.
+    if(REXGLUE_USE_VULKAN)
+        set(REXUI_PLATFORM_SOURCES
+            surface_gnulinux.cpp
+        )
+    endif()
 endif()
 
 # Combine sources
@@ -161,20 +165,25 @@ endif()
 
 # Platform-specific dependencies
 if(UNIX AND NOT APPLE)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(X11_XCB REQUIRED x11-xcb)
-    # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
-    # Linux build.
-    pkg_check_modules(WAYLAND REQUIRED wayland-client)
+    # X11 and Wayland are only needed to create Vulkan surfaces; a KMSDRM/GLES
+    # device build has neither.
+    if(REXGLUE_USE_VULKAN)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+        # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on
+        # every Linux build.
+        pkg_check_modules(WAYLAND REQUIRED wayland-client)
 
-    target_include_directories(rexui PUBLIC
-        ${X11_XCB_INCLUDE_DIRS}
-        ${WAYLAND_INCLUDE_DIRS}
-    )
-    target_link_libraries(rexui PUBLIC
-        ${X11_XCB_LIBRARIES}
-        ${WAYLAND_LIBRARIES}
-    )
+        target_compile_definitions(rexui PUBLIC REX_HAS_X11_WAYLAND_SURFACES=1)
+        target_include_directories(rexui PUBLIC
+            ${X11_XCB_INCLUDE_DIRS}
+            ${WAYLAND_INCLUDE_DIRS}
+        )
+        target_link_libraries(rexui PUBLIC
+            ${X11_XCB_LIBRARIES}
+            ${WAYLAND_LIBRARIES}
+        )
+    endif()
 elseif(APPLE)
     target_link_libraries(rexui PRIVATE "-framework CoreFoundation")
 endif()

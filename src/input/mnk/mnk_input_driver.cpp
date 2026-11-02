@@ -169,6 +169,10 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
     }
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
+    // AddListener does not replay the current focus state, and KMSDRM never
+    // emits a focus event (there is no window manager). Pick up the state the
+    // window recorded when it opened, otherwise mnk ignores every key.
+    has_focus_ = window->HasFocus();
   }
 }
 

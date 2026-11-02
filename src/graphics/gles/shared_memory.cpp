@@ -32,31 +32,42 @@ bool GlesSharedMemory::Initialize() {
   }
 
   buffers_.resize(storage_buffer_count(), 0);
-  GetFunctions().GenBuffers(GLsizei(buffers_.size()), buffers_.data());
-  if (buffers_.empty() || buffers_.front() == 0) {
-    REXGPU_ERROR("GLES shared memory: glGenBuffers failed");
-    buffers_.clear();
+
+  // Slices are allocated when a draw first needs them. The R36S has 1 GB of
+  // RAM and its Mali blob refuses large SSBO allocations, so reserving the
+  // entire 512 MB mirror up front makes the command processor fail to start.
+  REXGPU_INFO("GLES shared memory: {} x {} MB storage buffers (allocated on demand)",
+              uint32_t(buffers_.size()), uint32_t(slice_size_log2() ?
+                  (uint32_t(1) << slice_size_log2()) >> 20 : 0));
+  return true;
+}
+
+bool GlesSharedMemory::EnsureBuffer(uint32_t slice_index) {
+  if (slice_index >= buffers_.size()) {
     return false;
   }
-
+  if (buffers_[slice_index]) {
+    return true;
+  }
+  GLuint buffer = 0;
+  GetFunctions().GenBuffers(1, &buffer);
+  if (!buffer) {
+    REXGPU_ERROR("GLES shared memory: glGenBuffers failed for slice {}", slice_index);
+    return false;
+  }
   const GLsizeiptr slice_size = GLsizeiptr(uint32_t(1) << slice_size_log2());
-  bool available = true;
-  for (size_t i = 0; i < buffers_.size(); ++i) {
-    GetFunctions().BindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[i]);
-    GetFunctions().BufferData(GL_SHADER_STORAGE_BUFFER, slice_size, nullptr, GL_STATIC_DRAW);
-    GetFunctions().BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    if (GetFunctions().GetError() != GL_NO_ERROR) {
-      REXGPU_ERROR("GLES shared memory: failed to allocate a {} MB buffer slice",
-                   uint32_t(slice_size >> 20));
-      available = false;
-    }
-  }
-  if (!available) {
-    Shutdown();
+  GetFunctions().BindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+  GetFunctions().BufferData(GL_SHADER_STORAGE_BUFFER, slice_size, nullptr, GL_DYNAMIC_DRAW);
+  const GLenum error = GetFunctions().GetError();
+  GetFunctions().BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+  if (error != GL_NO_ERROR) {
+    REXGPU_ERROR("GLES shared memory: failed to allocate slice {} ({} MB), GL error 0x{:X}",
+                 slice_index, uint32_t(slice_size >> 20), uint32_t(error));
+    GetFunctions().DeleteBuffers(1, &buffer);
     return false;
   }
-
-  REXGPU_INFO("GLES shared memory: {} x {} MB storage buffers", uint32_t(buffers_.size()),
+  buffers_[slice_index] = buffer;
+  REXGPU_INFO("GLES shared memory: allocated slice {} ({} MB)", slice_index,
               uint32_t(slice_size >> 20));
   return true;
 }
@@ -98,6 +109,9 @@ bool GlesSharedMemory::UploadRanges(
         REXGPU_ERROR("GLES shared memory: upload outside the buffer at 0x{:08X}", address);
         return false;
       }
+      if (!EnsureBuffer(slice_index)) {
+        return false;
+      }
       // Mark valid before touching the data so CPU invalidation racing with the
       // memcpy is not lost (same contract as the Vulkan backend).
       MakeRangeValid(address, chunk, false);
@@ -127,6 +141,9 @@ bool GlesSharedMemory::WriteRangeFromGuestMemory(uint32_t start, uint32_t length
     const uint32_t slice_offset = start & slice_mask;
     const uint32_t chunk = std::min(length, slice_size - slice_offset);
     if (slice_index >= buffers_.size()) {
+      return false;
+    }
+    if (!EnsureBuffer(slice_index)) {
       return false;
     }
     GetFunctions().BindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[slice_index]);

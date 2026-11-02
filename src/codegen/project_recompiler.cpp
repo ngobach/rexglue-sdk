@@ -238,7 +238,12 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
                                  entryXexPath.string(), gameRoot.string()));
   }
 
-  auto runtime = std::make_unique<Runtime>(gameRoot.string());
+  // Codegen is a batch tool and exits right after writing the files. The
+  // runtime's teardown joins a kernel dispatch thread that can already have
+  // exited, which hangs in pthread_join on macOS; leaking the runtime here
+  // keeps every codegen invocation (and therefore every build) from blocking.
+  auto runtime = std::unique_ptr<Runtime, void (*)(Runtime*)>(new Runtime(gameRoot.string()),
+                                                             [](Runtime*) {});
   auto rtStatus = runtime->Setup(rex::RuntimeConfig{
       .kernel_init = rex::kernel::InitializeKernel,
       .tool_mode = true,

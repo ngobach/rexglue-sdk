@@ -899,7 +899,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    // Called on every guest thread switch; the R36S has 4 cores, so warn only
+    // once instead of flooding the log (and the SD card) while the game runs.
+    static bool warned_once = false;
+    if (!warned_once) {
+      warned_once = true;
+      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+    }
   }
 }
 

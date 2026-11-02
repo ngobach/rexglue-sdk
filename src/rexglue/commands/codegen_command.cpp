@@ -12,6 +12,8 @@
 #include "project_scan.h"
 #include "template_utils.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -214,7 +216,13 @@ Result<void> CodegenFromConfig(const std::string& config_path, const CliContext&
   if (!rex::codegen::ManifestConfig::WriteSdkVersionStamp(manifest_path, current_version)) {
     REXLOG_WARN("Failed to stamp manifest sdkVersion");
   }
-  return rex::Ok();
+
+  // Codegen is a short-lived batch tool. Its runtime teardown joins a kernel
+  // dispatch thread that may already have exited, which hangs in pthread_join
+  // on macOS - blocking every build that needs to regenerate. All generated
+  // files have been written by now, so skip global destruction entirely.
+  std::fflush(nullptr);
+  std::_Exit(0);
 }
 
 void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pending) {

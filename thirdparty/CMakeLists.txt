@@ -44,13 +44,17 @@ set(REQUIRED_SUBMODULES
     sdl3
 )
 
-if(REXGLUE_USE_VULKAN)
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_GLES)
     list(APPEND REQUIRED_SUBMODULES
-        vulkan-headers vulkan-memory-allocator
         spirv-headers spirv-tools glslang
     )
-    if(APPLE)
-        list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+    if(REXGLUE_USE_VULKAN)
+        list(APPEND REQUIRED_SUBMODULES
+            vulkan-headers vulkan-memory-allocator
+        )
+        if(APPLE)
+            list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+        endif()
     endif()
 endif()
 
@@ -363,9 +367,10 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 #=============================================================================
-# SPIR-V toolchain (only when Vulkan backend is enabled)
+# SPIR-V toolchain (needed by the shader translator, which both the Vulkan and
+# the GLES backend use)
 #=============================================================================
-if(REXGLUE_USE_VULKAN)
+if(REXGLUE_USE_VULKAN OR REXGLUE_USE_GLES)
     # SPIRV-Headers
     set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
@@ -494,7 +499,11 @@ endif()
 #=============================================================================
 if(IS_ARM64)
   enable_language(ASM)
-  set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
+  # -march=armv8-a is an Apple/assembler flag; a cross toolchain already knows
+  # its target CPU and zig's integrated assembler rejects it.
+  if(APPLE)
+    set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
+  endif()
 endif()
 
 # libavutil - FFmpeg utility library (must build first)

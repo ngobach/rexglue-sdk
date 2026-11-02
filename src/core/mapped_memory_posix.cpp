@@ -21,9 +21,10 @@
 #include <rex/platform.h>
 
 // macOS off_t is 64-bit and provides no *64 large-file variants; the base
-// names already are the large-file interfaces. Linux still ships legacy 32-bit
-// off_t on some distributions, so keep the explicit *64 forms there.
-#if defined(__APPLE__)
+// names already are the large-file interfaces. The same is true on LP64 Linux
+// (aarch64/x86-64): glibc only exports stat64/fstat64 as symbols from 2.33, so
+// use the base names there too to stay compatible with older device images.
+#if defined(__APPLE__) || defined(__LP64__)
 using rex_stat64_t = struct stat;
 using rex_off64_t = off_t;
 #define rex_fstat64 fstat

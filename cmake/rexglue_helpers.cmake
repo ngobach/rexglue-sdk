@@ -53,7 +53,9 @@ function(rexglue_apply_target_settings target_name)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
-        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64" AND NOT CMAKE_CROSSCOMPILING)
+            # A cross toolchain (zig cc) targets the baseline CPU already and its
+            # integrated assembler rejects the -march=armv8-a spelling.
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()
     endif()

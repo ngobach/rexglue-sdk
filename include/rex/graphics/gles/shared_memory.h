@@ -61,6 +61,9 @@ class GlesSharedMemory final : public SharedMemory {
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
+  // Allocates one storage-buffer slice on first use (lazy mirror growth).
+  bool EnsureBuffer(uint32_t slice_index);
+
   uint32_t storage_buffer_count_log2_;
   bool gpu_copy_enabled_ = true;
   std::vector<GLuint> buffers_;

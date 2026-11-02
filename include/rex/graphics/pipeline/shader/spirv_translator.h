@@ -20,7 +20,12 @@
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/translator.h>
 #include <rex/graphics/xenos.h>
-#include <rex/ui/vulkan/device.h>
+
+// Only the Vulkan feature constructor needs the device, and this header is
+// also compiled for GLES-only builds (no Vulkan headers available there).
+namespace rex::ui::vulkan {
+class VulkanDevice;
+}  // namespace rex::ui::vulkan
 
 namespace rex::graphics {
 
@@ -418,10 +423,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // `uniform uint xe_vfetch_data_N[kVertexMemoryUniformCount]` filled per
     // draw. The fragment stage keeps using textures.
     bool vertex_memory_uniforms = false;
-    // Dwords per vertex memory uniform array. Three arrays plus the other
-    // uniforms stay inside GL_MAX_VERTEX_UNIFORM_VECTORS (1024 vectors on ANGLE
-    // Metal).
-    static constexpr uint32_t kVertexMemoryUniformCount = 512;
+    // Dwords per vertex memory uniform array. Mali counts every scalar element
+    // of a plain uniform array as a full vec4 slot, and a vertex shader using
+    // two arrays (vfetch + index) plus the system/fetch/bool constants hits
+    // "Too many uniform locations" at 448 while 416 still links; 384 leaves
+    // headroom for shaders that also use float constants.
+    static constexpr uint32_t kVertexMemoryUniformCount = 384;
 
     // Whether dFdxCoarse/dFdyCoarse (GL_ARB_derivative_control, GLSL ES 3.20)
     // are available; otherwise plain dFdx/dFdy are used.
