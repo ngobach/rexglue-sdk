@@ -23,4 +23,9 @@ extern double g_texture_upload_seconds;
 extern uint64_t g_texture_load_count;
 extern uint64_t g_texture_load_bytes;
 
+// EDRAM resolve readback (glReadPixels), which also waits for the GPU.
+extern double g_resolve_readback_seconds;
+extern uint64_t g_resolve_readback_calls;
+extern uint64_t g_resolve_readback_bytes;
+
 }  // namespace rex::graphics::gles

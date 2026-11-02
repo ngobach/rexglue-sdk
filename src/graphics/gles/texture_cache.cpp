@@ -461,9 +461,13 @@ bool GlesTextureCache::DecodeLevel(GlesTexture& texture, const HostFormat& host_
   // TexImage3D on the R36S).
   depth_out = is_3d ? depth : layer_count;
 
-  data_out.resize(size_t(width_out) * height_out * depth * layer_count *
-                  host_format.bytes_per_pixel);
-  std::memset(data_out.data(), 0, data_out.size());
+  const size_t data_size = size_t(width_out) * height_out * depth * layer_count *
+                           host_format.bytes_per_pixel;
+  // Reuse the staging buffer; only grow it. Every pixel below is written, so no
+  // clear is needed (the previous code zero-filled twice per decode).
+  if (data_out.size() < data_size) {
+    data_out.resize(data_size);
+  }
 
   const uint8_t* guest_memory = memory_.TranslatePhysical(level_base);
   const uint32_t* const guest_memory_end = nullptr;
@@ -668,7 +672,7 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
     if (!is_base) {
       level_address += layout.mip_offsets_bytes[level];
     }
-    std::vector<uint8_t> data;
+    std::vector<uint8_t>& data = decode_staging_;
     uint32_t width, height, depth;
     const auto decode_start = std::chrono::steady_clock::now();
     if (!DecodeLevel(gles_texture, host_format, level, level_address, packed, data, width, height,
@@ -690,7 +694,7 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
       REXGPU_INFO("GLES texture cache: decoded {}x{}x{} (dim {}, page 0x{:X}, level {})", width,
                   height, depth, uint32_t(key.dimension), key.base_page, level);
     }
-    g_texture_load_bytes += data.size();
+    g_texture_load_bytes += size_t(width) * height * depth * host_format.bytes_per_pixel;
     if (level == 0 && !is_cube && !is_3d) {
       if (const char* dump_dir = getenv("GLES_DUMP_TEXTURES")) {
         char path[512];

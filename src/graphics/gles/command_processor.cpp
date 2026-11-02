@@ -187,15 +187,20 @@ void BindTextureUnit(uint32_t unit, GLenum target, GLuint texture) {
 // GLES_LOG_FPS report: time spent submitting draws (including texture decoding
 // and vertex data uploads) versus the whole guest frame.
 double g_draw_seconds_accumulated = 0.0;
+double g_uniform_seconds_accumulated = 0.0;
+double g_resolve_seconds_accumulated = 0.0;
 uint64_t g_draw_calls_accumulated = 0;
 
-struct ScopedDrawTimer {
+struct ScopedAccumulator {
+  double* accumulator;
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-  ~ScopedDrawTimer() {
-    g_draw_seconds_accumulated += std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - start).count();
-    ++g_draw_calls_accumulated;
+  ~ScopedAccumulator() {
+    *accumulator += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   }
+};
+
+struct ScopedDrawTimer : ScopedAccumulator {
+  ScopedDrawTimer() : ScopedAccumulator{&g_draw_seconds_accumulated} { ++g_draw_calls_accumulated; }
 };
 
 }  // namespace
@@ -1546,6 +1551,7 @@ void GlesCommandProcessor::UpdateSystemConstantValues(
 void GlesCommandProcessor::SetStageConstants(const GlesProgram& program,
                                              const GlesShader& vertex_shader,
                                              const GlesShader* pixel_shader) {
+  ScopedAccumulator uniform_timer{&g_uniform_seconds_accumulated};
   const RegisterFile& regs = *register_file_;
 
   uint32_t bool_loop_constants[8 + 32];
@@ -2009,6 +2015,13 @@ void GlesCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 }
 
 bool GlesCommandProcessor::IssueCopy() {
+  ScopedAccumulator resolve_timer{&g_resolve_seconds_accumulated};
+  // Diagnostic: measure the frame without the EDRAM readback. The presented
+  // image comes from guest memory (the resolved texture), so this renders
+  // black; it only isolates the resolve cost.
+  if (getenv("GLES_SKIP_RESOLVE")) {
+    return true;
+  }
   static uint32_t logged_copies = 0;
   if (logged_copies < 5) {
     ++logged_copies;
@@ -2192,14 +2205,28 @@ void GlesCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuf
       const double frame_ms = seconds * 1000.0 / double(frames);
       REXGPU_INFO(
           "GLES swap {} ({:.1f} fps) frontbuffer={}x{} frame {:.1f} ms, draw {:.1f} ms "
-          "({:.1f} calls), textures {:.1f} ms (decode {:.1f}, upload {:.1f}; {} loads, {} KB), "
+          "({:.1f} calls; uniforms {:.1f}, textures {:.1f} [decode {:.1f}, upload {:.1f}], "
+          "sto {:.1f}; {} loads, {} KB), resolve {:.1f} (readback {:.1f}, {} calls, {} KB), "
           "other {:.1f} ms",
           swaps, fps, frontbuffer_width, frontbuffer_height, frame_ms, draw_ms,
-          draws_per_frame, g_texture_load_seconds * 1000.0 / double(frames),
+          draws_per_frame, g_uniform_seconds_accumulated * 1000.0 / double(frames),
+          g_texture_load_seconds * 1000.0 / double(frames),
           g_texture_decode_seconds * 1000.0 / double(frames),
-          g_texture_upload_seconds * 1000.0 / double(frames), g_texture_load_count,
-          g_texture_load_bytes >> 10, std::max(0.0, frame_ms - draw_ms));
+          g_texture_upload_seconds * 1000.0 / double(frames),
+          std::max(0.0, draw_ms - g_uniform_seconds_accumulated * 1000.0 / double(frames) -
+                            g_texture_load_seconds * 1000.0 / double(frames)),
+          g_texture_load_count, g_texture_load_bytes >> 10,
+          g_resolve_seconds_accumulated * 1000.0 / double(frames),
+          g_resolve_readback_seconds * 1000.0 / double(frames), g_resolve_readback_calls,
+          g_resolve_readback_bytes >> 10,
+          std::max(0.0, frame_ms - draw_ms -
+                            g_resolve_seconds_accumulated * 1000.0 / double(frames)));
       g_draw_seconds_accumulated = 0.0;
+      g_uniform_seconds_accumulated = 0.0;
+      g_resolve_seconds_accumulated = 0.0;
+      g_resolve_readback_seconds = 0.0;
+      g_resolve_readback_calls = 0;
+      g_resolve_readback_bytes = 0;
       g_draw_calls_accumulated = 0;
       g_texture_load_seconds = 0.0;
       g_texture_decode_seconds = 0.0;

@@ -130,6 +130,10 @@ class GlesTextureCache final : public TextureCache {
   uint32_t max_texture_width_ = 0;
   uint32_t max_texture_height_ = 0;
   uint32_t max_texture_depth_ = 0;
+  // Reused across uploads: allocating a multi-megabyte vector for every
+  // texture load (the 1280x720 background is reloaded every frame on the
+  // R36S) added several milliseconds per frame.
+  std::vector<uint8_t> decode_staging_;
   std::unordered_map<SamplerParameters, GLuint, SamplerParameters::Hasher> samplers_;
 };
 

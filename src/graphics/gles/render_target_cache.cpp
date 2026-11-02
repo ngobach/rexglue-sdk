@@ -10,12 +10,14 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 
 #include <rex/assert.h>
 #include <rex/graphics/gles/constants.h>
+#include <rex/graphics/gles/frame_stats.h>
 #include <rex/graphics/gles/render_target_cache.h>
 #include <rex/graphics/gles/shared_memory.h>
 #include <rex/graphics/gles/texture_cache.h>
@@ -28,6 +30,10 @@
 #include <rex/logging.h>
 
 namespace rex::graphics::gles {
+
+double g_resolve_readback_seconds = 0.0;
+uint64_t g_resolve_readback_calls = 0;
+uint64_t g_resolve_readback_bytes = 0;
 
 namespace {
 
@@ -349,11 +355,18 @@ void GlesRenderTargetCache::ReadRenderTargetPixels(GlesRenderTarget& render_targ
   // block: a per-row readback is a synchronous round trip each, which costs more
   // than the entire rest of the frame on ANGLE/Metal.
   const uint32_t gl_y_base = render_target.height - (guest_y + height);
-  resolve_row_.resize(size_t(width) * height * 4);
+  const size_t readback_bytes = size_t(width) * height * 4;
+  resolve_row_.resize(readback_bytes);
   GetFunctions().BindFramebuffer(GL_READ_FRAMEBUFFER, render_target.framebuffer);
   GetFunctions().PixelStorei(GL_PACK_ALIGNMENT, 1);
+  const std::chrono::steady_clock::time_point readback_start =
+      std::chrono::steady_clock::now();
   GetFunctions().ReadPixels(GLint(guest_x), GLint(gl_y_base), GLsizei(width), GLsizei(height),
                             GL_RGBA, GL_UNSIGNED_BYTE, resolve_row_.data());
+  g_resolve_readback_seconds += std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - readback_start).count();
+  ++g_resolve_readback_calls;
+  g_resolve_readback_bytes += readback_bytes;
   for (uint32_t row = 0; row < height; ++row) {
     // The guest k_8_8_8_8 format is D3D A8R8G8B8, stored as B, G, R, A bytes.
     const uint8_t* source_row = resolve_row_.data() + size_t(height - 1 - row) * width * 4;
@@ -410,8 +423,36 @@ bool GlesRenderTargetCache::ResolveCopy(const memory::Memory& memory,
     ResolveCopyDumpRectangle::Dispatch dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
     const uint32_t dispatch_count =
         rectangle.GetDispatches(dump_pitch, dump_row_length, dispatches);
+    const uint32_t source_pitch_tiles = render_target->key().GetPitchTiles();
     for (uint32_t d = 0; d < dispatch_count; ++d) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[d];
+      // Fast path: the whole block of tiles is contiguous in the source render
+      // target with the same pitch, so it can be read with a single
+      // ReadPixels. Each call otherwise flushes the GPU pipeline; a full-frame
+      // resolve used to issue 45 of them (~97 ms on the R36S).
+      const uint32_t first_tile = dump_base + dispatch.offset;
+      const uint32_t source_local_first =
+          (first_tile - render_target->key().base_tiles) & (xenos::kEdramTileCount - 1);
+      const uint32_t source_x = (source_local_first % source_pitch_tiles) * kTileWidth;
+      const uint32_t source_y = (source_local_first / source_pitch_tiles) * kTileHeight;
+      const uint32_t block_width = dispatch.width_tiles * kTileWidth;
+      const uint32_t block_height = dispatch.height_tiles * kTileHeight;
+      const bool block_contiguous =
+          source_pitch_tiles == dump_pitch &&
+          source_local_first + (dispatch.height_tiles - 1) * dump_pitch + dispatch.width_tiles <=
+              xenos::kEdramTileCount &&
+          (source_local_first % source_pitch_tiles) + dispatch.width_tiles <= source_pitch_tiles &&
+          source_y + block_height <= render_target->height;
+      if (block_contiguous) {
+        const uint32_t dump_row_first = dispatch.offset / dump_pitch;
+        const uint32_t first_column = dispatch.offset % dump_pitch;
+        ReadRenderTargetPixels(*render_target, source_x, source_y, block_width, block_height,
+                               resolve_dump_.data() +
+                                   (size_t(dump_row_first) * kTileHeight * dump_width +
+                                    size_t(first_column) * kTileWidth) * 4,
+                               dump_width * 4);
+        continue;
+      }
       for (uint32_t row = 0; row < dispatch.height_tiles; ++row) {
         const uint32_t dump_row = dispatch.offset / dump_pitch + row;
         const uint32_t first_column = dispatch.offset % dump_pitch;
