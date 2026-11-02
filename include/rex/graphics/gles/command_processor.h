@@ -52,6 +52,8 @@ class GlesCommandProcessor final : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
 
+  void WriteRegister(uint32_t index, uint32_t value) override;
+
  private:
   void UpdateSystemConstantValues(const PrimitiveProcessor::ProcessingResult& processing_result,
                                   const draw_util::ViewportInfo& viewport_info,

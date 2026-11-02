@@ -73,10 +73,12 @@ uint8_t FloatToUNorm8(float value) {
   return uint8_t(value * 255.0f + 0.5f);
 }
 
+// Guest k_8_8_8_8 is D3D A8R8G8B8: in little-endian memory the bytes are
+// B, G, R, A, so the 32-bit value has blue in the lowest byte.
 void UnpackRGBA8(uint32_t value, uint8_t* out) {
-  out[0] = uint8_t(value & 0xFF);
+  out[0] = uint8_t((value >> 16) & 0xFF);
   out[1] = uint8_t((value >> 8) & 0xFF);
-  out[2] = uint8_t((value >> 16) & 0xFF);
+  out[2] = uint8_t(value & 0xFF);
   out[3] = uint8_t((value >> 24) & 0xFF);
 }
 
@@ -554,6 +556,19 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
                                                              bool load_mips) {
   GlesTexture& gles_texture = static_cast<GlesTexture&>(texture);
   const TextureKey& key = gles_texture.key();
+  if (getenv("GLES_LOG_TEXTURES")) {
+    static uint32_t logged_textures = 0;
+    if (logged_textures < 200) {
+      ++logged_textures;
+      fprintf(stderr,
+              "TEXTURE gl=%u %ux%ux%u fmt=%s mips=%u tiled=%d dim=%u endian=%u page=0x%X "
+              "mip=0x%X\n",
+              gles_texture.name(), key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
+              FormatInfo::Get(key.format)->name, uint32_t(key.mip_max_level), int(key.tiled),
+              uint32_t(key.dimension), uint32_t(key.endianness), key.base_page, key.mip_page);
+      fflush(stderr);
+    }
+  }
   HostFormat host_format;
   if (!GetHostFormat(key.format, host_format) || !gles_texture.EnsureCreated()) {
     return false;
@@ -593,6 +608,20 @@ bool GlesTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, b
                   key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
                   FormatInfo::Get(key.format)->name);
       return false;
+    }
+    if (level == 0 && !is_cube && !is_3d) {
+      if (const char* dump_dir = getenv("GLES_DUMP_TEXTURES")) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/tex_%08X_%ux%u_%s.ppm", dump_dir, key.base_page, width,
+                 height, FormatInfo::Get(key.format)->name);
+        if (FILE* dump_file = fopen(path, "wb")) {
+          fprintf(dump_file, "P6\n%u %u\n255\n", width, height);
+          for (size_t pixel = 0; pixel < size_t(width) * height; ++pixel) {
+            fwrite(data.data() + pixel * 4, 1, 3, dump_file);
+          }
+          fclose(dump_file);
+        }
+      }
     }
     const uint32_t layer_count = is_cube ? 6 : (is_3d ? 1 : depth);
     const GLsizei gl_depth = GLsizei(is_3d ? depth : layer_count);

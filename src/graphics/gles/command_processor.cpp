@@ -12,6 +12,7 @@
 #include <rex/graphics/gles/command_processor.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -1614,6 +1615,22 @@ bool GlesCommandProcessor::BindTextures(const GlesProgram& program,
     GetFunctions().BindSampler(0, 0);
     return true;
   }
+  if (getenv("GLES_LOG_DRAW_TEXTURES")) {
+    static uint32_t draws_logged = 0;
+    if (draws_logged < 40) {
+      ++draws_logged;
+      fprintf(stderr, "DRAWTEX program=%u", program.program);
+      for (const GlesProgram::SamplerBinding& sampler : program.samplers) {
+        const xenos::xe_gpu_texture_fetch_t fetch =
+            register_file_->GetTextureFetch(sampler.fetch_constant);
+        fprintf(stderr, " [fc%u page=0x%X %ux%u fmt%u]", sampler.fetch_constant,
+                uint32_t(fetch.base_address), uint32_t(fetch.size_2d.width) + 1,
+                uint32_t(fetch.size_2d.height) + 1, uint32_t(fetch.format));
+      }
+      fprintf(stderr, "\n");
+      fflush(stderr);
+    }
+  }
   uint32_t texture_unit = 0;
   static std::set<GLuint> logged_texture_programs;
   const bool log_textures =
@@ -1662,9 +1679,16 @@ bool GlesCommandProcessor::BindTextures(const GlesProgram& program,
       if (sampler.uniform_location >= 0) {
         GetFunctions().GetUniformiv(program.program, sampler.uniform_location, &value);
       }
-      fprintf(stderr, "  guest sampler[%u] loc=%d fc=%u tex=%u target=0x%X uniform=%d\n",
+      const xenos::xe_gpu_texture_fetch_t fetch =
+          register_file_->GetTextureFetch(sampler.fetch_constant);
+      fprintf(stderr,
+              "  guest sampler[%u] loc=%d fc=%u tex=%u target=0x%X uniform=%d "
+              "fetch=%ux%u fmt=%u dim=%u tiled=%u stacked=%u page=0x%X\n",
               texture_unit, sampler.uniform_location, sampler.fetch_constant, texture,
-              uint32_t(target), value);
+              uint32_t(target), value, uint32_t(fetch.size_2d.width) + 1,
+              uint32_t(fetch.size_2d.height) + 1, uint32_t(fetch.format),
+              uint32_t(fetch.dimension), uint32_t(fetch.tiled), uint32_t(fetch.stacked),
+              uint32_t(fetch.base_address));
       fflush(stderr);
     }
     ++texture_unit;
@@ -1927,6 +1951,18 @@ bool GlesCommandProcessor::BindVertexMemoryTextures(const GlesProgram& program,
   return true;
 }
 
+void GlesCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  CommandProcessor::WriteRegister(index, value);
+  // The texture cache keeps its bindings until it is told that the guest changed
+  // a texture fetch constant; without this every draw samples whichever texture
+  // was bound to the fetch constant first.
+  if (texture_cache_ && index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    texture_cache_->TextureFetchConstantWritten(
+        (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+  }
+}
+
 bool GlesCommandProcessor::IssueCopy() {
   static uint32_t logged_copies = 0;
   if (logged_copies < 5) {
@@ -2096,6 +2132,18 @@ void GlesCommandProcessor::PresentRenderTargetTexture(GLuint texture, uint32_t w
 void GlesCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                      uint32_t frontbuffer_height) {
   frame_draw_index_ = 0;
+  if (getenv("GLES_LOG_FPS")) {
+    static uint32_t swaps = 0;
+    static auto swap_start = std::chrono::steady_clock::now();
+    ++swaps;
+    if (swaps % 30 == 1) {
+      const double seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - swap_start).count();
+      REXGPU_INFO("GLES swap {} ({:.1f} fps) frontbuffer={}x{}", swaps,
+                  seconds > 0.0 ? double(swaps) / seconds : 0.0, frontbuffer_width,
+                  frontbuffer_height);
+    }
+  }
   if (getenv("GLES_DEBUG_SWAP_READ") && render_target_cache_) {
     static uint32_t logged_swap_reads = 0;
     if (logged_swap_reads < 20) {

@@ -343,7 +343,16 @@ void GlesRenderTargetCache::ReadRenderTargetPixels(GlesRenderTarget& render_targ
   for (uint32_t row = 0; row < height; ++row) {
     GetFunctions().ReadPixels(GLint(guest_x), GLint(gl_y_base + (height - 1 - row)), GLsizei(width), 1,
                      GL_RGBA, GL_UNSIGNED_BYTE, resolve_row_.data());
-    std::memcpy(dest + size_t(row) * dest_stride, resolve_row_.data(), size_t(width) * 4);
+    // The guest k_8_8_8_8 format is D3D A8R8G8B8, stored as B, G, R, A bytes.
+    uint8_t* dest_row = dest + size_t(row) * dest_stride;
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint8_t* source = resolve_row_.data() + size_t(x) * 4;
+      uint8_t* out = dest_row + size_t(x) * 4;
+      out[0] = source[2];
+      out[1] = source[1];
+      out[2] = source[0];
+      out[3] = source[3];
+    }
   }
   GetFunctions().BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 }
