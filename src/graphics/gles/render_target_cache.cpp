@@ -335,18 +335,21 @@ void GlesRenderTargetCache::ReadRenderTargetPixels(GlesRenderTarget& render_targ
                                                    uint32_t height, uint8_t* dest,
                                                    uint32_t dest_stride) {
   // Guest row 0 is stored at GL row (height - 1), so read the mirrored block and
-  // flip it while copying into the destination.
+  // flip it while copying into the destination. One ReadPixels for the whole
+  // block: a per-row readback is a synchronous round trip each, which costs more
+  // than the entire rest of the frame on ANGLE/Metal.
   const uint32_t gl_y_base = render_target.height - (guest_y + height);
-  resolve_row_.resize(size_t(width) * 4);
+  resolve_row_.resize(size_t(width) * height * 4);
   GetFunctions().BindFramebuffer(GL_READ_FRAMEBUFFER, render_target.framebuffer);
   GetFunctions().PixelStorei(GL_PACK_ALIGNMENT, 1);
+  GetFunctions().ReadPixels(GLint(guest_x), GLint(gl_y_base), GLsizei(width), GLsizei(height),
+                            GL_RGBA, GL_UNSIGNED_BYTE, resolve_row_.data());
   for (uint32_t row = 0; row < height; ++row) {
-    GetFunctions().ReadPixels(GLint(guest_x), GLint(gl_y_base + (height - 1 - row)), GLsizei(width), 1,
-                     GL_RGBA, GL_UNSIGNED_BYTE, resolve_row_.data());
     // The guest k_8_8_8_8 format is D3D A8R8G8B8, stored as B, G, R, A bytes.
+    const uint8_t* source_row = resolve_row_.data() + size_t(height - 1 - row) * width * 4;
     uint8_t* dest_row = dest + size_t(row) * dest_stride;
     for (uint32_t x = 0; x < width; ++x) {
-      const uint8_t* source = resolve_row_.data() + size_t(x) * 4;
+      const uint8_t* source = source_row + size_t(x) * 4;
       uint8_t* out = dest_row + size_t(x) * 4;
       out[0] = source[2];
       out[1] = source[1];
